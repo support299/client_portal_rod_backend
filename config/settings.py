@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
 from pathlib import Path
+from decouple import config
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -37,6 +38,8 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'rest_framework',
+    'ghl',
 ]
 
 MIDDLEWARE = [
@@ -123,5 +126,30 @@ STATIC_URL = 'static/'
 MAILERS = {
     'default': {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+    },
+}
+
+
+# GoHighLevel OAuth
+# The redirect URI must match the one registered in the GHL Marketplace app,
+# and must not contain "ghl" or "highlevel".
+
+GHL_CLIENT_ID = config('GHL_CLIENT_ID', default='')
+GHL_CLIENT_SECRET = config('GHL_CLIENT_SECRET', default='')
+GHL_REDIRECT_URI = config('GHL_REDIRECT_URI', default='http://localhost:8000/crm/oauth/callback/')
+GHL_SCOPES = config('GHL_SCOPES', default='contacts.readonly opportunities.readonly locations.readonly')  # space-separated
+GHL_USER_TYPE = config('GHL_USER_TYPE', default='Location')  # 'Location' or 'Company'
+GHL_SUCCESS_REDIRECT = config('GHL_SUCCESS_REDIRECT', default='')
+
+
+# Celery
+
+CELERY_BROKER_URL = config('CELERY_BROKER_URL', default='redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = config('CELERY_RESULT_BACKEND', default=CELERY_BROKER_URL)
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_BEAT_SCHEDULE = {
+    'refresh-all-ghl-tokens': {
+        'task': 'ghl.tasks.refresh_all_ghl_tokens',
+        'schedule': 10 * 60 * 60,  # every 10 hours
     },
 }
