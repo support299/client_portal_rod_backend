@@ -57,3 +57,105 @@ class GHLContact(models.Model):
 
     def __str__(self):
         return self.contact_name or self.email or self.ghl_id
+
+
+class GHLUser(models.Model):
+    """A GHL user; one row per user, with every location they belong to."""
+
+    user_id = models.CharField(max_length=64, unique=True)
+    company_id = models.CharField(max_length=64, blank=True, db_index=True)
+    first_name = models.CharField(max_length=255, blank=True)
+    last_name = models.CharField(max_length=255, blank=True)
+    name = models.CharField(max_length=255, blank=True)
+    email = models.CharField(max_length=255, blank=True, db_index=True)
+    phone = models.CharField(max_length=64, blank=True)
+    extension = models.CharField(max_length=32, blank=True)
+    role_type = models.CharField(max_length=32, blank=True)  # "account" or "agency"
+    role = models.CharField(max_length=32, blank=True)  # "admin" or "user"
+    location_ids = models.JSONField(default=list, blank=True)
+    permissions = models.JSONField(default=dict, blank=True)
+    deleted = models.BooleanField(default=False)
+    date_added = models.DateTimeField(null=True, blank=True)
+    date_updated = models.DateTimeField(null=True, blank=True)
+    synced_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.name or self.email or self.user_id
+
+
+class GHLPipelineStage(models.Model):
+    """A pipeline stage synced from GHL; pipeline details are repeated on each stage."""
+
+    stage_id = models.CharField(max_length=64, unique=True)
+    pipeline_id = models.CharField(max_length=64, db_index=True)
+    pipeline_name = models.CharField(max_length=255, blank=True)
+    location_id = models.CharField(max_length=64, db_index=True)
+    name = models.CharField(max_length=255, blank=True)
+    position = models.IntegerField(default=0)
+    win_probability = models.IntegerField(null=True, blank=True)
+    show_in_funnel = models.BooleanField(default=True)
+    show_in_pie_chart = models.BooleanField(default=True)
+    raw = models.JSONField(default=dict, blank=True)
+    synced_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["pipeline_id", "position"]
+
+    def __str__(self):
+        return f"{self.pipeline_name} / {self.name}" if self.pipeline_name else self.name or self.stage_id
+
+
+class GHLOpportunity(models.Model):
+    """An opportunity synced from a GHL location."""
+
+    STATUS_CHOICES = [("open", "Open"), ("won", "Won"), ("lost", "Lost"), ("abandoned", "Abandoned")]
+
+    opportunity_id = models.CharField(max_length=64, unique=True)
+    location_id = models.CharField(max_length=64, db_index=True)
+    # Keyed on the GHL contact id, so contact_id holds the same value GHL sends.
+    contact = models.ForeignKey(
+        GHLContact,
+        to_field="ghl_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opportunities",
+    )
+    name = models.CharField(max_length=255, blank=True)
+    monetary_value = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    pipeline_id = models.CharField(max_length=64, blank=True, db_index=True)
+    # Raw stage id as GHL sends it, kept even if the stage isn't in our table.
+    pipeline_stage_id = models.CharField(max_length=64, blank=True, db_index=True)
+    stage = models.ForeignKey(
+        GHLPipelineStage,
+        to_field="stage_id",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opportunities",
+    )
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, blank=True, db_index=True)
+    source = models.CharField(max_length=255, blank=True)
+    assigned_to = models.CharField(max_length=64, blank=True)
+    lost_reason_id = models.CharField(max_length=64, blank=True)
+    followers = models.JSONField(default=list, blank=True)
+    expected_close_date = models.DateField(null=True, blank=True)
+    original_close_date = models.DateField(null=True, blank=True)
+    forecast_slippage_count = models.IntegerField(default=0)
+    forecast_days_slipped = models.IntegerField(default=0)
+    forecast_probability = models.IntegerField(null=True, blank=True)
+    effective_probability = models.IntegerField(null=True, blank=True)
+    custom_fields = models.JSONField(default=list, blank=True)
+    attributions = models.JSONField(default=list, blank=True)
+    last_status_change_at = models.DateTimeField(null=True, blank=True)
+    last_stage_change_at = models.DateTimeField(null=True, blank=True)
+    date_added = models.DateTimeField(null=True, blank=True)
+    date_updated = models.DateTimeField(null=True, blank=True)
+    raw = models.JSONField(default=dict, blank=True)
+    synced_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name_plural = "GHL opportunities"
+
+    def __str__(self):
+        return self.name or self.opportunity_id

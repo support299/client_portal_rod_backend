@@ -11,7 +11,7 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
 from pathlib import Path
-from decouple import config
+from decouple import Csv, config
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -24,9 +24,14 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-bnygoa%c8rrr4yyb4b@9ghw8*g(*l2zgo6za##&0$50r1$2lf='
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = config('DEBUG', default=False, cast=bool)
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1', cast=Csv())
+CSRF_TRUSTED_ORIGINS = config('CSRF_TRUSTED_ORIGINS', default='', cast=Csv())
+
+# CORS (django-cors-headers)
+CORS_ALLOWED_ORIGINS = config('CORS_ALLOWED_ORIGINS', default='', cast=Csv())
+CORS_ALLOW_CREDENTIALS = True
 
 
 # Application definition
@@ -38,12 +43,14 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'corsheaders',
     'rest_framework',
     'ghl',
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -77,8 +84,12 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': config('DB_NAME', default='rod_loan_dashboard'),
+        'USER': config('DB_USER', default='postgres'),
+        'PASSWORD': config('DB_PASSWORD', default=''),
+        'HOST': config('DB_HOST', default='localhost'),
+        'PORT': config('DB_PORT', default='5432'),
     }
 }
 
@@ -139,6 +150,8 @@ GHL_CLIENT_SECRET = config('GHL_CLIENT_SECRET', default='')
 GHL_REDIRECT_URI = config('GHL_REDIRECT_URI', default='http://localhost:8000/crm/oauth/callback/')
 GHL_SCOPES = config('GHL_SCOPES', default='contacts.readonly opportunities.readonly locations.readonly')  # space-separated
 GHL_USER_TYPE = config('GHL_USER_TYPE', default='Location')  # 'Location' or 'Company'
+# The app/version id is the client id's prefix before the "-"; override if the install link differs.
+GHL_VERSION_ID = config('GHL_VERSION_ID', default=GHL_CLIENT_ID.split('-')[0])
 GHL_SUCCESS_REDIRECT = config('GHL_SUCCESS_REDIRECT', default='')
 
 
