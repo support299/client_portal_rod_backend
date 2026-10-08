@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 
 
@@ -54,6 +55,11 @@ class GHLContact(models.Model):
     date_updated = models.DateTimeField(null=True, blank=True)
     raw = models.JSONField(default=dict, blank=True)
     synced_at = models.DateTimeField(auto_now=True)
+    # The borrower login for this contact; linked by email (see AccountLinkService).
+    account = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="ghl_contacts",
+    )
 
     def __str__(self):
         return self.contact_name or self.email or self.ghl_id
@@ -77,7 +83,13 @@ class GHLUser(models.Model):
     deleted = models.BooleanField(default=False)
     date_added = models.DateTimeField(null=True, blank=True)
     date_updated = models.DateTimeField(null=True, blank=True)
+    raw = models.JSONField(default=dict, blank=True)
     synced_at = models.DateTimeField(auto_now=True)
+    # The staff login for this GHL user; linked by email (see AccountLinkService).
+    account = models.OneToOneField(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="ghl_user",
+    )
 
     def __str__(self):
         return self.name or self.email or self.user_id

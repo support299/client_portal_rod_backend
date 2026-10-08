@@ -2,7 +2,7 @@ import secrets
 from urllib.parse import quote, urlencode
 
 from django.conf import settings
-from django.db.models import OuterRef, Q, Subquery
+from django.db.models import F, OuterRef, Q, Subquery
 from django.http import HttpResponseRedirect
 from django.utils.dateparse import parse_date
 from rest_framework import status
@@ -15,7 +15,7 @@ from rest_framework.views import APIView
 
 from .client import AUTHORIZE_URL, GHLAuthError, exchange_code
 from .models import GHLOpportunity, GHLPipelineStage, GHLToken, GHLUser
-from .serializers import GHLConnectionSerializer, OpportunitySerializer
+from .serializers import GHLConnectionSerializer, OpportunitySerializer, UserSerializer
 from .tasks import sync_ghl_location
 
 
@@ -68,6 +68,14 @@ def oauth_callback(request):
     return Response({"connected": True, **GHLConnectionSerializer(token).data})
 
 
+def visible_opportunities(user):
+    """Admins see every opportunity; everyone else only those assigned to their linked GHL user."""
+    qs = GHLOpportunity.objects.all()
+    if user.is_app_admin:
+        return qs
+    return qs.filter(assigned_to__in=GHLUser.objects.filter(account=user).values("user_id"))
+
+
 class OpportunityPagination(PageNumberPagination):
     page_size = 25
     page_size_query_param = "page_size"
@@ -75,7 +83,7 @@ class OpportunityPagination(PageNumberPagination):
 
 
 class OpportunityListView(ListAPIView):
-    """List synced opportunities.
+    """List synced opportunities. Non-admins only see opportunities assigned to them.
 
     Query params (all optional): location_id, pipeline_id, stage_id, status,
     assigned_to, source, search (opportunity name / contact name, email, phone),
@@ -100,8 +108,9 @@ class OpportunityListView(ListAPIView):
     def get_queryset(self):
         params = self.request.query_params
         assigned_name = GHLUser.objects.filter(user_id=OuterRef("assigned_to")).values("name")[:1]
-        qs = GHLOpportunity.objects.select_related("contact", "stage").annotate(
-            assigned_to_name=Subquery(assigned_name)
+        qs = visible_opportunities(self.request.user).select_related("contact", "stage").annotate(
+            assigned_to_name=Subquery(assigned_name),
+            loan_id=F("loan__id"),
         )
 
         for param, field in self.FILTER_PARAMS.items():
@@ -130,10 +139,41 @@ class OpportunityListView(ListAPIView):
         return qs.order_by(ordering, "-id")
 
 
+class UserListView(ListAPIView):
+    """List synced GHL users (deleted users excluded).
+
+    Query params (all optional): search (partial, case-insensitive match on
+    name, email, phone or user_id), location_id, page, page_size.
+    """
+
+    serializer_class = UserSerializer
+    pagination_class = OpportunityPagination
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        params = self.request.query_params
+        qs = GHLUser.objects.filter(deleted=False)
+
+        location_id = params.get("location_id")
+        if location_id:
+            qs = qs.filter(location_ids__contains=[location_id])
+
+        search = params.get("search", "").strip()
+        if search:
+            qs = qs.filter(
+                Q(name__icontains=search)
+                | Q(email__icontains=search)
+                | Q(phone__icontains=search)
+                | Q(user_id__icontains=search)
+            )
+        return qs.order_by("name", "id")
+
+
 class OpportunityFiltersView(APIView):
     """Options for the opportunity list filters.
 
     Query param: location_id (optional, limits every list to that location).
+    For non-admins, sources and assigned_to only cover their own opportunities.
     """
 
     permission_classes = [IsAuthenticated]
@@ -141,8 +181,10 @@ class OpportunityFiltersView(APIView):
     def get(self, request):
         location_id = request.query_params.get("location_id")
         stages = GHLPipelineStage.objects.all()
-        opportunities = GHLOpportunity.objects.all()
+        opportunities = visible_opportunities(request.user)
         users = GHLUser.objects.filter(deleted=False)
+        if not request.user.is_app_admin:
+            users = users.filter(account=request.user)
         if location_id:
             stages = stages.filter(location_id=location_id)
             opportunities = opportunities.filter(location_id=location_id)

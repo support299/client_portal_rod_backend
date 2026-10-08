@@ -1,3 +1,5 @@
+from django.contrib.auth import get_user_model
+from django.db.models import Exists, OuterRef, Subquery
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 
@@ -185,6 +187,8 @@ class OpportunityService:
         if batch:
             OpportunityService.upsert(batch, location_id)
             total += len(batch)
+        # ensure_contacts may have added placeholder contacts with emails.
+        AccountLinkService.link_contacts()
         return total
 
 
@@ -380,6 +384,7 @@ class ContactService:
         if batch:
             ContactService.upsert(batch)
             total += len(batch)
+        AccountLinkService.link_contacts()
         return total
 
 
@@ -460,4 +465,63 @@ class UserService:
             unique_fields=["user_id"],
             update_fields=UserService.UPDATE_FIELDS,
         )
+        AccountLinkService.link_ghl_users()
         return len(users)
+
+
+class AccountLinkService:
+    """Link GHL rows to dashboard logins by email (case-insensitive).
+
+    Staff logins link to a GHLUser, borrower logins to their GHLContact rows
+    (one per location). Sync upserts never touch `account`, so links survive re-syncs.
+    """
+
+    @staticmethod
+    def link_ghl_users():
+        """Link every unlinked GHLUser to the staff login with the same email. Returns the count linked."""
+        User = get_user_model()
+        taken = GHLUser.objects.filter(account__isnull=False).values("account_id")
+        staff = {
+            email.lower(): pk
+            for pk, email in User.objects.exclude(role=User.Role.BORROWER)
+            .exclude(pk__in=taken).values_list("pk", "email")
+        }
+        linked = 0
+        for pk, email in (
+            GHLUser.objects.filter(account__isnull=True, deleted=False)
+            .exclude(email="").values_list("pk", "email")
+        ):
+            account_id = staff.pop(email.lower(), None)
+            if account_id:
+                GHLUser.objects.filter(pk=pk).update(account_id=account_id)
+                linked += 1
+        return linked
+
+    @staticmethod
+    def link_contacts():
+        """Link every unlinked GHLContact to the borrower login with the same email. Returns the count linked."""
+        User = get_user_model()
+        borrower = User.objects.filter(
+            role=User.Role.BORROWER, email__iexact=OuterRef("email"),
+        ).values("pk")[:1]
+        return (
+            GHLContact.objects.filter(account__isnull=True).exclude(email="")
+            .filter(Exists(borrower))
+            .update(account=Subquery(borrower))
+        )
+
+    @staticmethod
+    def link_account(user):
+        """Re-link one login after it is created or its email/role changes."""
+        User = get_user_model()
+        GHLUser.objects.filter(account=user).update(account=None)
+        GHLContact.objects.filter(account=user).update(account=None)
+        if user.role == User.Role.BORROWER:
+            GHLContact.objects.filter(account__isnull=True, email__iexact=user.email).update(account=user)
+        else:
+            ghl_user = (
+                GHLUser.objects.filter(account__isnull=True, deleted=False, email__iexact=user.email)
+                .order_by("-date_updated").first()
+            )
+            if ghl_user:
+                GHLUser.objects.filter(pk=ghl_user.pk).update(account=user)
