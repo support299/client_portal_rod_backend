@@ -2,6 +2,7 @@ import logging
 from datetime import timedelta
 
 from celery import shared_task
+from loan.services import LoanService
 
 from .client import GHLAuthError, get_access_token
 from .models import GHLToken
@@ -38,7 +39,10 @@ def refresh_ghl_token(self, token_id):
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def sync_ghl_location(self, location_id):
-    """Sync users, contacts, then opportunities (and any missing pipeline stages) for one location."""
+    """Sync users, contacts, then opportunities (and any missing pipeline stages) for one location.
+
+    Afterwards every loan-pipeline opportunity without a loan gets one (see LoanService.ensure_pipeline_loans).
+    """
     try:
         users = UserService.sync(location_id)
         contacts = ContactService.sync(location_id)
@@ -46,9 +50,12 @@ def sync_ghl_location(self, location_id):
     except (GHLAuthError, GHLAPIError) as exc:
         logger.warning('GHL sync failed for location %s: %s', location_id, exc)
         raise self.retry(exc=exc)
-    logger.info('Synced %d user(s), %d contact(s) and %d opportunity(ies) for location %s',
-                users, contacts, opportunities, location_id)
-    return {'users': users, 'contacts': contacts, 'opportunities': opportunities}
+    loans, skipped = LoanService.ensure_pipeline_loans()
+    logger.info('Synced %d user(s), %d contact(s) and %d opportunity(ies) for location %s; '
+                'created %d loan(s), skipped %d',
+                users, contacts, opportunities, location_id, len(loans), len(skipped))
+    return {'users': users, 'contacts': contacts, 'opportunities': opportunities,
+            'loans_created': len(loans), 'loans_skipped': len(skipped)}
 
 
 @shared_task

@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'rest_framework',
     'ghl',
+    'webhook',
     'accounts',
     'loan',
 ]
@@ -170,6 +171,8 @@ GHL_USER_TYPE = config('GHL_USER_TYPE', default='Location')  # 'Location' or 'Co
 # The app/version id is the client id's prefix before the "-"; override if the install link differs.
 GHL_VERSION_ID = config('GHL_VERSION_ID', default=GHL_CLIENT_ID.split('-')[0])
 GHL_SUCCESS_REDIRECT = config('GHL_SUCCESS_REDIRECT', default='')
+# Ed25519 public key (PEM) from the GHL webhook docs; with \n escapes if set on one line.
+GHL_WEBHOOK_PUBLIC_KEY = config('GHL_WEBHOOK_PUBLIC_KEY', default='').replace('\\n', '\n')
 
 
 # Celery
@@ -183,3 +186,7 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': 10 * 60 * 60,  # every 10 hours
     },
 }
+
+# The one GHL pipeline this app handles ("02 Processing Pipeline"). A loan's status is its
+# opportunity's stage in this pipeline.
+LOAN_PIPELINE_ID = config('LOAN_PIPELINE_ID', default='mSfFTRYaWxMJ4JShKpBx')

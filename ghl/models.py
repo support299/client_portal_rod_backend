@@ -51,6 +51,7 @@ class GHLContact(models.Model):
     postal_code = models.CharField(max_length=32, blank=True)
     country = models.CharField(max_length=64, blank=True)
     dnd = models.BooleanField(default=False)
+    is_deleted = models.BooleanField(default=False, db_index=True)
     date_added = models.DateTimeField(null=True, blank=True)
     date_updated = models.DateTimeField(null=True, blank=True)
     raw = models.JSONField(default=dict, blank=True)
@@ -171,3 +172,30 @@ class GHLOpportunity(models.Model):
 
     def __str__(self):
         return self.name or self.opportunity_id
+
+
+class GHLOutboundLog(models.Model):
+    """One row per API call we make to GHL (e.g. updating an opportunity)."""
+
+    action = models.CharField(max_length=100, db_index=True)
+    object_id = models.CharField(max_length=64, blank=True, db_index=True)
+    location_id = models.CharField(max_length=64, blank=True, db_index=True)
+    triggered_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="ghl_outbound_logs",
+    )
+    method = models.CharField(max_length=8)
+    endpoint = models.CharField(max_length=255)
+    request_body = models.JSONField(null=True, blank=True)
+    response_body = models.JSONField(null=True, blank=True)
+    http_status = models.PositiveSmallIntegerField(null=True, blank=True)
+    success = models.BooleanField(default=False, db_index=True)
+    error = models.TextField(blank=True)
+    duration_ms = models.PositiveIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.action} {self.object_id} [{self.http_status}]"
