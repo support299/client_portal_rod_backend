@@ -76,33 +76,6 @@ class OpportunityService:
         params["locationId"] = token.location_id
         return GHLService.json(api_request(token, "GET", "/opportunities/search", params=params))
 
-    # Local field -> GHL payload key, for fields that can be pushed back to GHL.
-    PUSH_FIELDS = {
-        "name": "name",
-        "monetary_value": "monetaryValue",
-        "expected_close_date": "forecastExpectedCloseDate",
-    }
-
-    @staticmethod
-    def push_update(opportunity, **fields):
-        """Update an opportunity in GHL, then mirror the change locally.
-
-        GHL is written first, so a failure raises GHLAPIError and leaves our copy untouched.
-        fields are GHLOpportunity attribute names (see PUSH_FIELDS).
-        """
-        payload = {}
-        for field, value in fields.items():
-            key = OpportunityService.PUSH_FIELDS[field]
-            payload[key] = value.isoformat() if hasattr(value, "isoformat") else (str(value) if field == "monetary_value" else value)
-        if not payload:
-            return opportunity
-        token = GHLService.token_for_location(opportunity.location_id)
-        GHLService.json(api_request(token, "PUT", f"/opportunities/{opportunity.opportunity_id}", json=payload))
-        for field, value in fields.items():
-            setattr(opportunity, field, value)
-        opportunity.save(update_fields=list(fields))
-        return opportunity
-
     @staticmethod
     def iter_all(token, **params):
         """Yield every opportunity matching params, following startAfter/startAfterId cursors."""

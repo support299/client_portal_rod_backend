@@ -4,18 +4,30 @@ from urllib.parse import quote, urlencode
 from django.conf import settings
 from django.db.models import F, OuterRef, Q, Subquery
 from django.http import HttpResponseRedirect
+from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_date
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.generics import ListAPIView
+from rest_framework.generics import ListAPIView, RetrieveAPIView
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.views import IsAppAdmin, IsStaffMember
+
 from .client import AUTHORIZE_URL, GHLAuthError, exchange_code
-from .models import GHLOpportunity, GHLPipelineStage, GHLToken, GHLUser
-from .serializers import GHLConnectionSerializer, OpportunitySerializer, UserSerializer
+from .models import GHLOpportunity, GHLOutboundLog, GHLPipelineStage, GHLToken, GHLUser
+from .outbound import update_opportunity_in_ghl
+from .serializers import (
+    GHLConnectionSerializer,
+    OpportunitySerializer,
+    OpportunityUpdateSerializer,
+    OutboundLogDetailSerializer,
+    OutboundLogListSerializer,
+    UserSerializer,
+)
+from .services import GHLAPIError
 from .tasks import sync_ghl_location
 
 
@@ -82,6 +94,12 @@ class OpportunityPagination(PageNumberPagination):
     max_page_size = 100
 
 
+def annotate_opportunities(qs):
+    """Add the assignee's name and the converted loan id that OpportunitySerializer reads."""
+    assigned_name = GHLUser.objects.filter(user_id=OuterRef("assigned_to")).values("name")[:1]
+    return qs.annotate(assigned_to_name=Subquery(assigned_name), loan_id=F("loan__id"))
+
+
 class OpportunityListView(ListAPIView):
     """List synced opportunities. Non-admins only see opportunities assigned to them.
 
@@ -107,10 +125,8 @@ class OpportunityListView(ListAPIView):
 
     def get_queryset(self):
         params = self.request.query_params
-        assigned_name = GHLUser.objects.filter(user_id=OuterRef("assigned_to")).values("name")[:1]
-        qs = visible_opportunities(self.request.user).select_related("contact", "stage").annotate(
-            assigned_to_name=Subquery(assigned_name),
-            loan_id=F("loan__id"),
+        qs = annotate_opportunities(
+            visible_opportunities(self.request.user).select_related("contact", "stage")
         )
 
         for param, field in self.FILTER_PARAMS.items():
@@ -137,6 +153,51 @@ class OpportunityListView(ListAPIView):
         if ordering.lstrip("-") not in self.ORDERING_FIELDS:
             ordering = "-date_added"
         return qs.order_by(ordering, "-id")
+
+
+class OpportunityDetailView(APIView):
+    """Edit one opportunity (PATCH). Changes are pushed to GHL first, then saved locally.
+
+    Staff only; non-admins can only edit opportunities assigned to them and can't reassign.
+    Editable (all optional): name, monetary_value, status, pipeline_stage_id,
+    assigned_to, expected_close_date, pipeline_id, lost_reason_id, custom_fields
+    (a list of {id, field_value}). 502 if GHL rejects the change.
+    Also editable but saved in the dashboard only, never sent to GHL: source, followers,
+    original_close_date, forecast_probability, effective_probability,
+    forecast_slippage_count, forecast_days_slipped.
+    """
+
+    permission_classes = [IsStaffMember]
+
+    def patch(self, request, opportunity_id):
+        opportunity = get_object_or_404(visible_opportunities(request.user), opportunity_id=opportunity_id)
+        serializer = OpportunityUpdateSerializer(
+            data=request.data, partial=True, context={"opportunity": opportunity}
+        )
+        serializer.is_valid(raise_exception=True)
+        fields = serializer.validated_data
+        if "assigned_to" in fields and not request.user.is_app_admin:
+            return Response({"error": "Only admins can reassign opportunities."}, status=status.HTTP_403_FORBIDDEN)
+        if not fields:
+            return Response({"error": "No editable fields provided."}, status=status.HTTP_400_BAD_REQUEST)
+
+        local = {f: fields.pop(f) for f in OpportunityUpdateSerializer.LOCAL_ONLY_FIELDS if f in fields}
+        try:
+            # GHL first: if it rejects the change nothing is saved locally either.
+            update_opportunity_in_ghl(opportunity, triggered_by=request.user, **fields)
+        except GHLAPIError as exc:
+            return Response({"error": f"GHL rejected the update: {exc}"}, status=status.HTTP_502_BAD_GATEWAY)
+        except GHLToken.DoesNotExist as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        if local:
+            for field, value in local.items():
+                setattr(opportunity, field, value)
+            opportunity.save(update_fields=list(local))
+
+        opportunity = annotate_opportunities(
+            GHLOpportunity.objects.select_related("contact", "stage")
+        ).get(pk=opportunity.pk)
+        return Response(OpportunitySerializer(opportunity).data)
 
 
 class UserListView(ListAPIView):
@@ -217,3 +278,52 @@ class OpportunityFiltersView(APIView):
 def oauth_status(request):
     """List connected GHL accounts (no tokens exposed)."""
     return Response({"connections": GHLConnectionSerializer(GHLToken.objects.all(), many=True).data})
+
+
+class OutboundLogListView(ListAPIView):
+    """List our API calls to GHL, newest first. Admins only; bodies are only in the detail view.
+
+    Query params (all optional): action, object_id, location_id, method,
+    success (true/false), http_status, triggered_by (user id), search (object id /
+    endpoint / error), date_from / date_to (YYYY-MM-DD, on created_at), page, page_size.
+    """
+
+    serializer_class = OutboundLogListSerializer
+    pagination_class = OpportunityPagination
+    permission_classes = [IsAppAdmin]
+
+    FILTER_PARAMS = ("action", "object_id", "location_id", "method", "http_status", "triggered_by")
+
+    def get_queryset(self):
+        params = self.request.query_params
+        qs = GHLOutboundLog.objects.select_related("triggered_by").defer("request_body", "response_body")
+
+        for field in self.FILTER_PARAMS:
+            if params.get(field):
+                qs = qs.filter(**{field: params[field]})
+
+        success = params.get("success", "").lower()
+        if success in ("true", "false"):
+            qs = qs.filter(success=success == "true")
+
+        search = params.get("search", "").strip()
+        if search:
+            qs = qs.filter(
+                Q(object_id__icontains=search) | Q(endpoint__icontains=search) | Q(error__icontains=search)
+            )
+
+        date_from = parse_date(params.get("date_from", ""))
+        date_to = parse_date(params.get("date_to", ""))
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+        return qs
+
+
+class OutboundLogDetailView(RetrieveAPIView):
+    """One outbound GHL call including its request and response bodies. Admins only."""
+
+    queryset = GHLOutboundLog.objects.select_related("triggered_by")
+    serializer_class = OutboundLogDetailSerializer
+    permission_classes = [IsAppAdmin]

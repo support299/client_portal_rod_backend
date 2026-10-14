@@ -10,5 +10,8 @@ urlpatterns = [
     path("oauth/status/", views.oauth_status, name="oauth_status"),
     path("opportunities/", views.OpportunityListView.as_view(), name="opportunity_list"),
     path("opportunities/filters/", views.OpportunityFiltersView.as_view(), name="opportunity_filters"),
+    path("opportunities/<str:opportunity_id>/", views.OpportunityDetailView.as_view(), name="opportunity_detail"),
     path("users/", views.UserListView.as_view(), name="user_list"),
+    path("outbound-logs/", views.OutboundLogListView.as_view(), name="outbound_log_list"),
+    path("outbound-logs/<int:pk>/", views.OutboundLogDetailView.as_view(), name="outbound_log_detail"),
 ]

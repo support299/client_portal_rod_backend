@@ -10,7 +10,8 @@ from rest_framework.views import APIView
 
 from accounts.views import IsStaffMember
 from ghl.models import GHLPipelineStage
-from ghl.services import GHLAPIError, OpportunityService
+from ghl.outbound import update_opportunity_in_ghl
+from ghl.services import GHLAPIError
 from ghl.views import visible_opportunities
 
 from .models import Loan
@@ -157,4 +158,4 @@ class LoanDetailView(RetrieveUpdateAPIView):
         if officers is not None:
             LoanService.set_officers(serializer.instance, officers)
         if shared:
-            OpportunityService.push_update(serializer.instance.opportunity, **shared)
+            update_opportunity_in_ghl(serializer.instance.opportunity, triggered_by=self.request.user, **shared)

@@ -2,12 +2,19 @@ import json
 import logging
 
 from django.db import transaction
+from django.db.models import Q
+from django.utils.dateparse import parse_date
 from rest_framework import status
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.generics import ListAPIView, RetrieveAPIView
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
+from accounts.views import IsAppAdmin
+
 from .models import GHLWebhookLog
+from .serializers import WebhookLogDetailSerializer, WebhookLogListSerializer
 from .services import verify_signature
 from .tasks import process_ghl_webhook
 
@@ -57,3 +64,62 @@ def webhook(request):
 
     transaction.on_commit(enqueue)
     return Response({"status": "received"})
+
+
+class LogPagination(PageNumberPagination):
+    page_size = 25
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+class WebhookLogListView(ListAPIView):
+    """List received GHL webhook deliveries, newest first. Admins only; payload is only in the detail view.
+
+    Query params (all optional): event_type, status, location_id, object_id,
+    contact_id, webhook_id, signature_valid (true/false), search (object / contact /
+    webhook / location id), date_from / date_to (YYYY-MM-DD, on received_at),
+    page, page_size.
+    """
+
+    serializer_class = WebhookLogListSerializer
+    pagination_class = LogPagination
+    permission_classes = [IsAppAdmin]
+
+    FILTER_PARAMS = ("event_type", "status", "location_id", "object_id", "contact_id", "webhook_id")
+
+    def get_queryset(self):
+        params = self.request.query_params
+        qs = GHLWebhookLog.objects.defer("payload")
+
+        for field in self.FILTER_PARAMS:
+            if params.get(field):
+                qs = qs.filter(**{field: params[field]})
+
+        valid = params.get("signature_valid", "").lower()
+        if valid in ("true", "false"):
+            qs = qs.filter(signature_valid=valid == "true")
+
+        search = params.get("search", "").strip()
+        if search:
+            qs = qs.filter(
+                Q(object_id__icontains=search)
+                | Q(contact_id__icontains=search)
+                | Q(webhook_id__icontains=search)
+                | Q(location_id__icontains=search)
+            )
+
+        date_from = parse_date(params.get("date_from", ""))
+        date_to = parse_date(params.get("date_to", ""))
+        if date_from:
+            qs = qs.filter(received_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(received_at__date__lte=date_to)
+        return qs
+
+
+class WebhookLogDetailView(RetrieveAPIView):
+    """One webhook delivery including its payload. Admins only."""
+
+    queryset = GHLWebhookLog.objects.all()
+    serializer_class = WebhookLogDetailSerializer
+    permission_classes = [IsAppAdmin]

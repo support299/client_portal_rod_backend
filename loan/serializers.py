@@ -19,6 +19,7 @@ class LoanSerializer(serializers.ModelSerializer):
     opportunity_status = serializers.CharField(source="opportunity.status", read_only=True)
     source = serializers.CharField(source="opportunity.source", read_only=True)
     assigned_to = serializers.CharField(source="opportunity.assigned_to", read_only=True)
+    lost_reason_id = serializers.CharField(source="opportunity.lost_reason_id", read_only=True)
     expected_close_date = serializers.DateField(source="opportunity.expected_close_date", read_only=True)
     custom_fields = serializers.JSONField(source="opportunity.custom_fields", read_only=True)
     borrower = UserSerializer(read_only=True)
@@ -34,7 +35,7 @@ class LoanSerializer(serializers.ModelSerializer):
             "id", "opportunity", "contact", "borrower", "loan_officers", "loan_officer", "status", "status_label",
             "name", "loan_amount", "location_id", "pipeline_id", "pipeline_name",
             "pipeline_stage_id", "stage_name", "opportunity_status", "source", "assigned_to",
-            "expected_close_date", "custom_fields", "created_by", "created_at", "updated_at",
+            "lost_reason_id", "expected_close_date", "custom_fields", "created_by", "created_at", "updated_at",
         ]
         read_only_fields = fields
 

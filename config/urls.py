@@ -19,7 +19,7 @@ from django.urls import include, path
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('crm/webhook/', include('webhook.urls')),
+    path('api/crm/webhook/', include('webhook.urls')),
     path('crm/', include('ghl.urls')),
     path('api/auth/', include('accounts.urls')),
     path('api/loans/', include('loan.urls')),
