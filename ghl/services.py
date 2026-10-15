@@ -1,3 +1,6 @@
+import logging
+
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db.models import Exists, OuterRef, Subquery
 from django.utils import timezone
@@ -5,6 +8,8 @@ from django.utils.dateparse import parse_date, parse_datetime
 
 from .client import api_request, get_location_token
 from .models import GHLContact, GHLOpportunity, GHLPipelineStage, GHLToken, GHLUser
+
+logger = logging.getLogger(__name__)
 
 
 class GHLAPIError(Exception):
@@ -468,6 +473,35 @@ class UserService:
         AccountLinkService.link_ghl_users()
         return len(users)
 
+    @staticmethod
+    def ensure(location_id, user_ids):
+        """Fetch and save the GHL users in `user_ids` we don't have yet (e.g. a new opportunity assignee).
+
+        Users GHL no longer has (404) are skipped. Returns the number saved.
+        """
+        user_ids = set(filter(None, user_ids))
+        missing = user_ids - set(GHLUser.objects.filter(user_id__in=user_ids).values_list("user_id", flat=True))
+        if not missing:
+            return 0
+        token = GHLService.token_for_location(location_id)
+        users = []
+        for user_id in missing:
+            try:
+                data = GHLService.json(api_request(token, "GET", f"/users/{user_id}"))
+            except GHLAPIError as exc:
+                if exc.status_code != 404:
+                    raise
+                continue
+            users.append(UserService.from_ghl(data.get("user", data), token.company_id))
+        GHLUser.objects.bulk_create(
+            users,
+            update_conflicts=True,
+            unique_fields=["user_id"],
+            update_fields=UserService.UPDATE_FIELDS,
+        )
+        AccountLinkService.link_ghl_users()
+        return len(users)
+
 
 class AccountLinkService:
     """Link GHL rows to dashboard logins by email (case-insensitive).
@@ -496,6 +530,36 @@ class AccountLinkService:
                 GHLUser.objects.filter(pk=pk).update(account_id=account_id)
                 linked += 1
         return linked
+
+    @staticmethod
+    def create_assignee_accounts():
+        """Create a staff login for every GHL user assigned to a loan-pipeline opportunity who has none.
+
+        The login is a Loan Officer with no password: it can't sign in until an admin sets one,
+        but it puts them on their loans' teams (the post_save signal links it and adds them).
+        An email that already belongs to a borrower is skipped. Returns the logins created.
+        """
+        User = get_user_model()
+        AccountLinkService.link_ghl_users()
+        assignees = (
+            GHLOpportunity.objects.filter(pipeline_id=settings.LOAN_PIPELINE_ID)
+            .exclude(assigned_to="").values("assigned_to")
+        )
+        created = []
+        for ghl_user in (
+            GHLUser.objects.filter(user_id__in=assignees, account__isnull=True, deleted=False).exclude(email="")
+        ):
+            if User.objects.filter(email__iexact=ghl_user.email).exists():
+                logger.warning("No login created for GHL user %s: %s is already in use", ghl_user.user_id, ghl_user.email)
+                continue
+            created.append(User.objects.create_user(
+                email=ghl_user.email,
+                first_name=ghl_user.first_name,
+                last_name=ghl_user.last_name,
+                phone=ghl_user.phone[:20],
+                role=User.Role.LOAN_OFFICER,
+            ))
+        return created
 
     @staticmethod
     def link_contacts():

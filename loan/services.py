@@ -3,6 +3,7 @@ import logging
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
+from django.db.models import Exists, OuterRef, Subquery
 
 from ghl.models import GHLOpportunity, GHLUser
 
@@ -43,14 +44,51 @@ class LoanService:
     @staticmethod
     @transaction.atomic
     def set_officers(loan, officers):
-        """Replace the loan's officers with `officers` (users), keeping existing assignments' order."""
-        wanted = {u.pk: u for u in officers}
+        """Replace the loan's officers with `officers` (users), keeping existing assignments' order.
+
+        The GHL assignee always stays on (see add_ghl_assignee); to remove them, reassign in GHL.
+        """
+        wanted = list(dict.fromkeys(u.pk for u in officers))
+        if loan.ghl_assignee_id and loan.ghl_assignee_id not in wanted:
+            wanted.append(loan.ghl_assignee_id)
         active = loan.officer_assignments.filter(is_deleted=False)
         active.exclude(officer_id__in=wanted).update(is_deleted=True)
         existing = set(active.values_list("officer_id", flat=True))
         LoanOfficer.objects.bulk_create(
-            [LoanOfficer(loan=loan, officer=u) for pk, u in wanted.items() if pk not in existing]
+            [LoanOfficer(loan=loan, officer_id=pk) for pk in wanted if pk not in existing]
         )
+
+    @staticmethod
+    def add_ghl_assignee(loan):
+        """Add the opportunity's GHL assigned user to the loan's officers, if they have a login.
+
+        Officers already on the loan are kept, including a previous GHL assignee.
+        """
+        assignee_id = loan.ghl_assignee_id
+        if assignee_id:
+            LoanOfficer.objects.bulk_create([LoanOfficer(loan=loan, officer_id=assignee_id)], ignore_conflicts=True)
+
+    @staticmethod
+    def add_ghl_assignees():
+        """add_ghl_assignee for every loan (after a sync, or once a GHL user gets linked to a login).
+
+        Returns the number of officers added.
+        """
+        assignee = GHLUser.objects.filter(
+            user_id=OuterRef("opportunity__assigned_to"), account__isnull=False,
+        ).values("account")[:1]
+        on_loan = LoanOfficer.objects.filter(loan=OuterRef("pk"), officer=OuterRef("assignee_id"), is_deleted=False)
+        missing = (
+            Loan.objects.filter(is_deleted=False)
+            .annotate(assignee_id=Subquery(assignee))
+            .filter(assignee_id__isnull=False)
+            .exclude(Exists(on_loan))
+            .values_list("pk", "assignee_id")
+        )
+        added = LoanOfficer.objects.bulk_create(
+            [LoanOfficer(loan_id=pk, officer_id=officer) for pk, officer in missing], ignore_conflicts=True,
+        )
+        return len(added)
 
     @staticmethod
     @transaction.atomic
@@ -67,18 +105,12 @@ class LoanService:
             raise LoanConversionError("The opportunity has no contact.")
 
         borrower, borrower_created = LoanService.get_or_create_borrower(opportunity.contact)
-        officer = (
-            GHLUser.objects.filter(user_id=opportunity.assigned_to, account__isnull=False)
-            .values_list("account", flat=True).first()
-            if opportunity.assigned_to else None
-        )
         loan = Loan.objects.create(
             opportunity=opportunity,
             borrower=borrower,
             created_by=created_by,
         )
-        if officer:
-            LoanOfficer.objects.create(loan=loan, officer_id=officer)
+        LoanService.add_ghl_assignee(loan)
         return loan, borrower_created
 
     @staticmethod
@@ -86,12 +118,15 @@ class LoanService:
         """Create the loan for a loan-pipeline opportunity, if it doesn't have one yet.
 
         Every opportunity in settings.LOAN_PIPELINE_ID is a loan, so this runs automatically
-        (webhook, backfill). Returns the new loan, or None if nothing was created.
+        (webhook, backfill). An existing loan gets the opportunity's current GHL assignee added
+        to its officers instead. Returns the new loan, or None if nothing was created.
         Raises LoanConversionError when the contact can't get a borrower login.
         """
         if opportunity.pipeline_id != settings.LOAN_PIPELINE_ID:
             return None
-        if Loan.objects.filter(opportunity=opportunity).exists():
+        existing = Loan.objects.filter(opportunity=opportunity).first()
+        if existing:
+            LoanService.add_ghl_assignee(existing)
             return None
         try:
             loan, _ = LoanService.create_from_opportunity(opportunity)

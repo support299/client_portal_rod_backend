@@ -22,12 +22,14 @@ class UserWriteSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, style={"input_type": "password"})
     # Annotated in the user list view; absent (None) on create/update responses.
     loan_count = serializers.IntegerField(read_only=True, default=None)
+    # The linked GHL user's id, or null; only users with one can be a loan's main officer.
+    ghl_user_id = serializers.CharField(source="ghl_user.user_id", read_only=True, default=None)
 
     class Meta:
         model = User
         fields = [
             "id", "email", "password", "first_name", "last_name", "full_name",
-            "phone", "role", "role_label", "is_active", "loan_count",
+            "phone", "role", "role_label", "is_active", "loan_count", "ghl_user_id",
         ]
 
     def validate_email(self, value):

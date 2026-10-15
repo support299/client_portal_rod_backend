@@ -15,6 +15,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.views import IsAppAdmin, IsStaffMember
+from loan.services import LoanService
 
 from .client import AUTHORIZE_URL, GHLAuthError, exchange_code
 from .models import GHLOpportunity, GHLOutboundLog, GHLPipelineStage, GHLToken, GHLUser
@@ -193,6 +194,9 @@ class OpportunityDetailView(APIView):
             for field, value in local.items():
                 setattr(opportunity, field, value)
             opportunity.save(update_fields=list(local))
+        if "assigned_to" in fields and hasattr(opportunity, "loan"):
+            # The new GHL assignee joins the loan's officers.
+            LoanService.add_ghl_assignee(opportunity.loan)
 
         opportunity = annotate_opportunities(
             GHLOpportunity.objects.select_related("contact", "stage")

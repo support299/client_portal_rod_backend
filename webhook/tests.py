@@ -6,7 +6,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from django.test import TestCase, override_settings
 
-from ghl.models import GHLOpportunity
+from accounts.models import User
+from ghl.models import GHLOpportunity, GHLUser
 
 from .models import GHLWebhookLog
 from .services import process_log
@@ -111,6 +112,25 @@ class ProcessLogTests(TestCase):
         self.assertEqual(log.status, "processed")
         opp = GHLOpportunity.objects.get(opportunity_id="opp1")
         self.assertEqual((opp.name, opp.pipeline_stage_id, opp.contact_id), ("123 Main St", "s1", "c1"))
+
+    @override_settings(LOAN_PIPELINE_ID="p1")
+    @mock.patch("ghl.services.api_request")
+    @mock.patch("webhook.services.api_request")
+    @mock.patch("ghl.services.GHLService.token_for_location")
+    def test_new_ghl_assignee_gets_a_login_and_joins_the_team(self, token, api, user_api):
+        token.return_value = mock.Mock(company_id="co1")
+        opportunity = {"opportunity": {**GHL_OPPORTUNITY["opportunity"], "assignedTo": "u9"}}
+        api.return_value = mock.Mock(ok=True, json=lambda: opportunity)
+        user_api.return_value = mock.Mock(ok=True, json=lambda: {
+            "id": "u9", "firstName": "Sam", "lastName": "Lee", "email": "sam@example.com",
+        })
+        with mock.patch("ghl.services.PipelineService.ensure_stages", return_value=set()):
+            process_log(self.make_log())
+        sam = User.objects.get(email="sam@example.com")
+        self.assertEqual((sam.role, sam.has_usable_password()), (User.Role.LOAN_OFFICER, False))
+        self.assertEqual(GHLUser.objects.get(user_id="u9").account, sam)
+        loan = GHLOpportunity.objects.get(opportunity_id="opp1").loan
+        self.assertEqual([o.email for o in loan.loan_officers], ["sam@example.com"])
 
     def test_delete_event_removes_local_row(self):
         with mock.patch("ghl.services.PipelineService.ensure_stages", return_value=set()):

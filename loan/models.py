@@ -1,5 +1,8 @@
 from django.conf import settings
 from django.db import models
+from django.utils.functional import cached_property
+
+from ghl.models import GHLUser
 
 
 class Loan(models.Model):
@@ -35,14 +38,33 @@ class Loan(models.Model):
     def __str__(self):
         return self.opportunity.name or f"Loan {self.pk}"
 
+    @cached_property
+    def ghl_assignee_id(self):
+        """The login of the opportunity's GHL assigned user, or None if they have none.
+
+        visible_loans annotates this to avoid a query per loan.
+        """
+        if not self.opportunity.assigned_to:
+            return None
+        return (
+            GHLUser.objects.filter(user_id=self.opportunity.assigned_to, account__isnull=False)
+            .values_list("account", flat=True).first()
+        )
+
     @property
     def loan_officers(self):
-        """The assigned officers, in assignment order (prefetch officer_assignments__officer)."""
-        return [a.officer for a in self.officer_assignments.all() if not a.is_deleted]
+        """The assigned officers: the GHL assignee first, then assignment order.
+
+        Each officer gets is_ghl_assignee. Prefetch officer_assignments__officer.
+        """
+        officers = [a.officer for a in self.officer_assignments.all() if not a.is_deleted]
+        for officer in officers:
+            officer.is_ghl_assignee = officer.pk == self.ghl_assignee_id
+        return sorted(officers, key=lambda o: not o.is_ghl_assignee)
 
     @property
     def loan_officer(self):
-        """The first-assigned officer (single-officer view of loan_officers)."""
+        """The first officer, i.e. the GHL assignee when they're on the loan (single-officer view of loan_officers)."""
         officers = self.loan_officers
         return officers[0] if officers else None
 

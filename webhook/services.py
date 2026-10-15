@@ -9,7 +9,7 @@ from django.utils import timezone
 
 from ghl.client import api_request
 from ghl.models import GHLOpportunity
-from ghl.services import AccountLinkService, GHLAPIError, GHLService, OpportunityService
+from ghl.services import AccountLinkService, GHLAPIError, GHLService, OpportunityService, UserService
 from loan.services import LoanConversionError, LoanService
 
 logger = logging.getLogger(__name__)
@@ -77,6 +77,10 @@ def process_log(log):
             OpportunityService.upsert([data.get("opportunity", data)], location_id)
             AccountLinkService.link_contacts()
             opportunity = GHLOpportunity.objects.select_related("contact").get(opportunity_id=log.object_id)
+            if opportunity.pipeline_id == settings.LOAN_PIPELINE_ID and opportunity.assigned_to:
+                # A GHL user we haven't synced yet gets fetched, and a login if they have none.
+                UserService.ensure(location_id, [opportunity.assigned_to])
+                AccountLinkService.create_assignee_accounts()
             try:
                 LoanService.ensure_loan(opportunity)
             except LoanConversionError as exc:

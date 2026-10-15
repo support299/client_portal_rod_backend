@@ -1,6 +1,6 @@
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import OuterRef, Q, Subquery
 from rest_framework import status
 from rest_framework.generics import ListAPIView, RetrieveUpdateAPIView
 from rest_framework.pagination import PageNumberPagination
@@ -9,7 +9,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.views import IsStaffMember
-from ghl.models import GHLPipelineStage
+from ghl.models import GHLPipelineStage, GHLUser
 from ghl.outbound import update_opportunity_in_ghl
 from ghl.services import GHLAPIError
 from ghl.views import visible_opportunities
@@ -21,10 +21,14 @@ from .services import LoanConversionError, LoanService
 
 def visible_loans(user):
     """Admins see every loan, borrowers their own loans, other staff the loans assigned to them."""
+    ghl_assignee = GHLUser.objects.filter(
+        user_id=OuterRef("opportunity__assigned_to"), account__isnull=False,
+    ).values("account")[:1]
     qs = (
         Loan.objects.filter(is_deleted=False)
         .select_related("borrower", "opportunity__contact", "opportunity__stage")
-        .prefetch_related("officer_assignments__officer")
+        .prefetch_related("officer_assignments__officer__ghl_user")
+        .annotate(ghl_assignee_id=Subquery(ghl_assignee))
     )
     if user.is_app_admin:
         return qs
@@ -119,9 +123,11 @@ class LoanDetailView(RetrieveUpdateAPIView):
     """Get (GET) or edit (PATCH partial, PUT full) one loan.
 
     Anyone gets a 404 for loans they can't see (see visible_loans). Borrowers are read-only;
-    non-admin staff can't change loan_officer.
-    Editable: loan_officer, and name / loan_amount / expected_close_date. The last three
-    belong to the GHL opportunity, so they are pushed to GHL first (502 if GHL rejects the change).
+    non-admin staff can't change the officers.
+    Editable: loan_officers (the team), main_officer (a team member with a GHL user, who becomes
+    the opportunity's assigned user in GHL), and name / loan_amount / expected_close_date.
+    main_officer and the last three belong to the GHL opportunity, so they are pushed to GHL
+    (502 if GHL rejects the change; nothing is saved then).
     """
 
     def get_permissions(self):
@@ -152,10 +158,17 @@ class LoanDetailView(RetrieveUpdateAPIView):
             if field in data:
                 shared[local] = data.pop(field)
         officers = data.pop("loan_officers", None)
+        main = data.pop("main_officer", None)
         serializer.validated_data.clear()
         serializer.validated_data.update(data)
         serializer.save()
+        loan = serializer.instance
+        if main is not None and main.ghl_user.user_id != loan.opportunity.assigned_to:
+            shared["assigned_to"] = main.ghl_user.user_id
+            loan.ghl_assignee_id = main.pk  # set_officers and the response see the new assignee
         if officers is not None:
-            LoanService.set_officers(serializer.instance, officers)
+            LoanService.set_officers(loan, officers)
+        elif main is not None:
+            LoanService.add_ghl_assignee(loan)
         if shared:
             update_opportunity_in_ghl(serializer.instance.opportunity, triggered_by=self.request.user, **shared)

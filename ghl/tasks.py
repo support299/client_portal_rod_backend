@@ -6,7 +6,7 @@ from loan.services import LoanService
 
 from .client import GHLAuthError, get_access_token
 from .models import GHLToken
-from .services import ContactService, GHLAPIError, OpportunityService, UserService
+from .services import AccountLinkService, ContactService, GHLAPIError, OpportunityService, UserService
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,10 @@ def refresh_ghl_token(self, token_id):
 def sync_ghl_location(self, location_id):
     """Sync users, contacts, then opportunities (and any missing pipeline stages) for one location.
 
-    Afterwards every loan-pipeline opportunity without a loan gets one (see LoanService.ensure_pipeline_loans).
+    Afterwards every loan-pipeline assignee without a login gets one (see
+    AccountLinkService.create_assignee_accounts), every loan-pipeline opportunity without a loan
+    gets one (see LoanService.ensure_pipeline_loans), and every loan gets its GHL assignee among
+    its officers (see LoanService.add_ghl_assignees).
     """
     try:
         users = UserService.sync(location_id)
@@ -50,12 +53,15 @@ def sync_ghl_location(self, location_id):
     except (GHLAuthError, GHLAPIError) as exc:
         logger.warning('GHL sync failed for location %s: %s', location_id, exc)
         raise self.retry(exc=exc)
+    accounts = AccountLinkService.create_assignee_accounts()
     loans, skipped = LoanService.ensure_pipeline_loans()
+    # Picks up GHL reassignments, and GHL users who only now got linked to a login.
+    LoanService.add_ghl_assignees()
     logger.info('Synced %d user(s), %d contact(s) and %d opportunity(ies) for location %s; '
-                'created %d loan(s), skipped %d',
-                users, contacts, opportunities, location_id, len(loans), len(skipped))
+                'created %d login(s), %d loan(s), skipped %d',
+                users, contacts, opportunities, location_id, len(accounts), len(loans), len(skipped))
     return {'users': users, 'contacts': contacts, 'opportunities': opportunities,
-            'loans_created': len(loans), 'loans_skipped': len(skipped)}
+            'accounts_created': len(accounts), 'loans_created': len(loans), 'loans_skipped': len(skipped)}
 
 
 @shared_task

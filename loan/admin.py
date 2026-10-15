@@ -23,7 +23,7 @@ class LoanAdmin(admin.ModelAdmin):
 
     @admin.display(description="Loan officers")
     def officers(self, obj):
-        return ", ".join(u.email for u in obj.loan_officers.all())
+        return ", ".join(u.email for u in obj.loan_officers)
 
     @admin.display(description="Stage", ordering="opportunity__stage__position")
     def stage(self, obj):

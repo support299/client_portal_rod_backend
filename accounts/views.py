@@ -59,7 +59,7 @@ class UserCreateView(ListCreateAPIView):
 
     def get_queryset(self):
         params = self.request.query_params
-        qs = User.objects.annotate(loan_count=Count("loans"))
+        qs = User.objects.select_related("ghl_user").annotate(loan_count=Count("loans"))
 
         staff = params.get("staff", "").lower()
         if staff == "true":

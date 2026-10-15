@@ -6,6 +6,16 @@ from accounts.serializers import UserSerializer
 from .models import Loan
 
 
+class LoanOfficerSerializer(UserSerializer):
+    # The officer who is the opportunity's assigned user in GHL (listed first, highlight it).
+    is_ghl_assignee = serializers.BooleanField(read_only=True, default=False)
+    # Null when the officer has no GHL user, so they can't be made the main officer.
+    ghl_user_id = serializers.CharField(source="ghl_user.user_id", read_only=True, default=None)
+
+    class Meta(UserSerializer.Meta):
+        fields = UserSerializer.Meta.fields + ["is_ghl_assignee", "ghl_user_id"]
+
+
 class LoanSerializer(serializers.ModelSerializer):
     # Read through the opportunity: GHL is the source of truth for these.
     name = serializers.CharField(source="opportunity.name", read_only=True)
@@ -23,8 +33,8 @@ class LoanSerializer(serializers.ModelSerializer):
     expected_close_date = serializers.DateField(source="opportunity.expected_close_date", read_only=True)
     custom_fields = serializers.JSONField(source="opportunity.custom_fields", read_only=True)
     borrower = UserSerializer(read_only=True)
-    loan_officers = UserSerializer(many=True, read_only=True)
-    loan_officer = UserSerializer(read_only=True)  # first officer, for single-officer clients
+    loan_officers = LoanOfficerSerializer(many=True, read_only=True)  # GHL assignee first
+    loan_officer = LoanOfficerSerializer(read_only=True)  # first officer, for single-officer clients
     # The status is the opportunity's stage in the loan pipeline: the id is the stable key, the name the label.
     status = serializers.CharField(source="opportunity.pipeline_stage_id", read_only=True)
     status_label = serializers.CharField(source="opportunity.stage.name", read_only=True, allow_null=True)
@@ -69,10 +79,11 @@ class BorrowerLoanSerializer(serializers.ModelSerializer):
 
 
 class LoanUpdateSerializer(serializers.ModelSerializer):
-    """Editable loan fields. loan_officer may only be changed by admins (enforced in validate).
+    """Editable loan fields. The officers may only be changed by admins (enforced in validate).
 
-    loan_officer is saved on the loan; name, loan_amount and expected_close_date
-    belong to the opportunity and are pushed to GHL by the view (see LoanDetailView).
+    loan_officers is saved on the loan; name, loan_amount, expected_close_date and
+    main_officer (as assigned_to) belong to the opportunity and are pushed to GHL by the view
+    (see LoanDetailView).
     """
 
     name = serializers.CharField(max_length=255, required=False)
@@ -85,10 +96,15 @@ class LoanUpdateSerializer(serializers.ModelSerializer):
     loan_officer = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.exclude(role=User.Role.BORROWER), allow_null=True, required=False, write_only=True,
     )
+    # The main officer: joins the team and becomes the opportunity's assigned user in GHL.
+    main_officer = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.exclude(role=User.Role.BORROWER).select_related("ghl_user"),
+        required=False, write_only=True,
+    )
 
     class Meta:
         model = Loan
-        fields = ["name", "loan_amount", "expected_close_date", "loan_officers", "loan_officer"]
+        fields = ["name", "loan_amount", "expected_close_date", "loan_officers", "loan_officer", "main_officer"]
 
     def validate_loan_amount(self, value):
         if value < 0:
@@ -106,6 +122,17 @@ class LoanUpdateSerializer(serializers.ModelSerializer):
             current = {u.pk for u in self.instance.loan_officers}
             if {u.pk for u in attrs["loan_officers"]} != current:
                 raise serializers.ValidationError({"loan_officers": "Only admins can reassign a loan."})
+        main = attrs.get("main_officer")
+        if main is not None:
+            if not user.is_app_admin and main.pk != self.instance.ghl_assignee_id:
+                raise serializers.ValidationError({"main_officer": "Only admins can reassign a loan."})
+            ghl_user = getattr(main, "ghl_user", None)
+            if ghl_user is None or ghl_user.deleted:
+                raise serializers.ValidationError(
+                    {"main_officer": f"{main.email} has no GHL user, so they can't be assigned in GHL."}
+                )
+            if "loan_officers" in attrs and main not in attrs["loan_officers"]:
+                attrs["loan_officers"].append(main)
         return attrs
 
     def to_representation(self, instance):
