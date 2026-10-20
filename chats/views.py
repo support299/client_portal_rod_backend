@@ -5,11 +5,16 @@ from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.generics import ListAPIView, RetrieveUpdateAPIView
 from rest_framework.pagination import PageNumberPagination
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.views import IsStaffMember
+from loan.document_views import GHL_ERRORS, ghl_failed
+from loan.models import DocumentRequest, LoanDocument
+from loan.serializers import DocumentRequestCreateSerializer, LoanDocumentUploadSerializer
+from loan.services import DocumentService
 from loan.views import visible_loans
 
 from .models import Chat
@@ -27,6 +32,14 @@ from .services import (
 def chat_for(user, pk):
     """The chat if the user can see it, else 404."""
     return get_object_or_404(visible_chats(user).select_related("loan"), pk=pk)
+
+
+def loan_chat_for(user, pk):
+    """The loan chat if the user can see it (404 otherwise); files and requests belong to a loan."""
+    chat = chat_for(user, pk)
+    if chat.kind != Chat.Kind.LOAN:
+        raise ChatError("Files and document requests can only be sent in a loan chat.")
+    return chat
 
 
 def inbox_row(request, chat):
@@ -145,6 +158,65 @@ class ChatMessagesView(APIView):
             message = ChatService.send_message(chat, request.user, serializer.validated_data["body"])
         except ChatError as exc:
             return error(exc)
+        return Response(MessageSerializer(message).data, status=status.HTTP_201_CREATED)
+
+
+class ChatAttachmentView(APIView):
+    """POST (multipart) file, and optionally body and request: send a file in a loan chat.
+
+    The file becomes one of the loan's documents (stored in GHL media). Sent against a document
+    request, it goes to review just like an upload from the Documents page.
+    """
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request, pk):
+        try:
+            chat = loan_chat_for(request.user, pk)
+        except ChatError as exc:
+            return error(exc)
+        serializer = LoanDocumentUploadSerializer(data=request.data, context={"request": request, "loan": chat.loan})
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            document = DocumentService.upload(
+                chat.loan, data["file"], request.user,
+                doc_request=data.get("request"),
+                document_type=data.get("document_type"),
+                direction=data["direction"],
+                origin=LoanDocument.Origin.CHAT,
+            )
+        except GHL_ERRORS as exc:
+            return ghl_failed(exc)
+        message = ChatService.send_message(chat, request.user, request.data.get("body", ""), attachments=[document])
+        return Response(MessageSerializer(message).data, status=status.HTTP_201_CREATED)
+
+
+class ChatDocumentRequestView(APIView):
+    """POST (staff): request a document from the borrower in a loan chat.
+
+    Same body as the loan's document-requests endpoint (document_type and/or name, description,
+    kind, due_date, form_file); returns the posted document_request message.
+    """
+
+    permission_classes = [IsStaffMember]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def post(self, request, pk):
+        try:
+            chat = loan_chat_for(request.user, pk)
+        except ChatError as exc:
+            return error(exc)
+        serializer = DocumentRequestCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            doc_request = DocumentService.create_request(
+                chat.loan, request.user, source=DocumentRequest.Source.CHAT, **serializer.validated_data,
+            )
+        except GHL_ERRORS as exc:
+            return ghl_failed(exc)
+        message = messages_queryset().get(pk=doc_request.message_id)
         return Response(MessageSerializer(message).data, status=status.HTTP_201_CREATED)
 
 

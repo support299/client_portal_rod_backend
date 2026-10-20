@@ -1,11 +1,18 @@
 from django.contrib.auth import get_user_model
+from django.urls import reverse
 from rest_framework import serializers
 
-from loan.models import LoanDocument
+from loan.models import DocumentRequest, LoanDocument
 
 from .models import Chat, Message
 
 User = get_user_model()
+
+
+def download_url(document, loan_id):
+    if loan_id is None:
+        return None
+    return reverse("loan:loan_document_download", kwargs={"loan_pk": loan_id, "pk": document.pk})
 
 
 class ChatUserSerializer(serializers.ModelSerializer):
@@ -17,21 +24,51 @@ class ChatUserSerializer(serializers.ModelSerializer):
 
 
 class AttachmentSerializer(serializers.ModelSerializer):
-    """A file sent with a message. The GHL url is left out on purpose: files are public there."""
+    """A file sent with a message. The GHL url is left out on purpose (files are public there):
+    download_url is the access-checked way to get it. request: the document request it answers.
+    """
+
+    download_url = serializers.SerializerMethodField()
 
     class Meta:
         model = LoanDocument
-        fields = ["id", "name", "content_type", "size", "loan"]
+        fields = ["id", "name", "content_type", "size", "loan", "request", "download_url"]
+
+    def get_download_url(self, obj):
+        return download_url(obj, obj.loan_id)
+
+
+class MessageDocumentRequestSerializer(serializers.ModelSerializer):
+    """The document request a document_request message posted (its status as of loading)."""
+
+    form_document = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DocumentRequest
+        fields = ["id", "name", "description", "kind", "status", "due_date", "reviewer_note", "form_document"]
+
+    def get_form_document(self, obj):
+        form = obj.form_document
+        if form is None or form.is_deleted:
+            return None
+        # A shared blank form has no loan; it is downloaded through the request's loan.
+        return {"id": form.pk, "name": form.name, "download_url": download_url(form, obj.loan_id)}
 
 
 class MessageSerializer(serializers.ModelSerializer):
     sender = ChatUserSerializer(read_only=True)
     attachments = AttachmentSerializer(many=True, read_only=True)
+    document_request = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
-        fields = ["id", "chat", "sender", "kind", "body", "attachments", "created_at"]
+        fields = ["id", "chat", "sender", "kind", "body", "attachments", "document_request", "created_at"]
         read_only_fields = fields
+
+    def get_document_request(self, message):
+        # Prefetched (non-deleted only) by services.messages_queryset.
+        doc_request = next(iter(message.document_requests.all()), None)
+        return MessageDocumentRequestSerializer(doc_request).data if doc_request else None
 
 
 class ChatSerializer(serializers.ModelSerializer):

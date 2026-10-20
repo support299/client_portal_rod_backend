@@ -8,7 +8,7 @@ from django.db.models import Count, Exists, F, OuterRef, Prefetch, Q, Subquery
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from loan.models import Loan, LoanOfficer
+from loan.models import DocumentRequest, Loan, LoanDocument, LoanOfficer
 
 from .models import Chat, ChatMember, ChatRead, Message
 
@@ -81,7 +81,13 @@ def messages_queryset():
     return (
         Message.objects.filter(is_deleted=False)
         .select_related("sender")
-        .prefetch_related("attachments")
+        .prefetch_related(
+            Prefetch("attachments", queryset=LoanDocument.objects.filter(is_deleted=False)),
+            Prefetch(
+                "document_requests",
+                queryset=DocumentRequest.objects.filter(is_deleted=False).select_related("form_document"),
+            ),
+        )
     )
 
 
@@ -138,15 +144,24 @@ class ChatService:
         )
 
     @staticmethod
-    def send_message(chat, sender, body, kind=Message.Kind.TEXT):
-        """Save a message and push it to the chat's participants once committed."""
+    def send_message(chat, sender, body, kind=Message.Kind.TEXT, attachments=(), document_request=None):
+        """Save a message and push it to the chat's participants once committed.
+
+        attachments (LoanDocuments) and document_request are linked to the message before the
+        push, so the pushed message carries them.
+        """
         from .serializers import MessageSerializer
 
         body = (body or "").strip()
-        if kind == Message.Kind.TEXT and not body:
+        if kind == Message.Kind.TEXT and not body and not attachments:
             raise ChatError("Message is empty.")
         with transaction.atomic():
             message = Message.objects.create(chat=chat, sender=sender, kind=kind, body=body)
+            if attachments:
+                LoanDocument.objects.filter(pk__in=[d.pk for d in attachments]).update(message=message)
+            if document_request is not None:
+                DocumentRequest.objects.filter(pk=document_request.pk).update(message=message)
+                document_request.message = message
             Chat.objects.filter(pk=chat.pk).update(last_message_at=message.created_at)
             if sender is not None:
                 ChatService.mark_read(chat, sender, at=message.created_at, notify=False)

@@ -202,7 +202,8 @@ class DocumentService:
 
     @staticmethod
     def upload(loan, file, user, doc_request=None, document_type=None,
-               direction=LoanDocument.Direction.BORROWER_UPLOAD, visible_to_borrower=True):
+               direction=LoanDocument.Direction.BORROWER_UPLOAD, visible_to_borrower=True,
+               origin=LoanDocument.Origin.APP):
         """Store a file for a loan. A borrower file sent against a request puts the request in review."""
         fields = DocumentService.push_to_ghl(loan.opportunity.location_id, file, loan.opportunity_id)
         with transaction.atomic():
@@ -212,7 +213,7 @@ class DocumentService:
                 document_type=document_type or (doc_request.document_type if doc_request else None),
                 direction=direction,
                 visible_to_borrower=visible_to_borrower,
-                origin=LoanDocument.Origin.APP,
+                origin=origin,
                 uploaded_by=user,
                 **fields,
             )
@@ -288,11 +289,11 @@ class DocumentService:
                 due_date=due_date,
                 requested_by=requested_by,
             )
-            doc_request.message = ChatService.send_message(
+            ChatService.send_message(
                 ChatService.ensure_loan_chat(loan), requested_by,
                 DocumentService.request_message(doc_request), kind=Message.Kind.DOCUMENT_REQUEST,
+                document_request=doc_request,
             )
-            doc_request.save(update_fields=["message", "updated_at"])
         return doc_request
 
     @staticmethod
@@ -315,6 +316,8 @@ class DocumentService:
         document.save(update_fields=["review_status", "reviewed_by", "reviewed_at"])
         doc_request = document.request
         if doc_request is None or not reviewed:
+            if review_status == LoanDocument.ReviewStatus.REJECTED:
+                DocumentService.post_rejection(document, user, note)
             return
         doc_request.status = (
             DocumentRequest.Status.UPLOADED if review_status == LoanDocument.ReviewStatus.ACCEPTED
@@ -325,6 +328,36 @@ class DocumentService:
         if note is not None:
             doc_request.reviewer_note = note
         doc_request.save(update_fields=["status", "reviewed_by", "reviewed_at", "reviewer_note", "updated_at"])
+        if review_status == LoanDocument.ReviewStatus.REJECTED:
+            # After the request is updated, so its chat card shows "needs revision" and the note.
+            DocumentService.post_rejection(document, user, note)
+
+    @staticmethod
+    def post_rejection(document, reviewer, note=None):
+        """Tell the borrower in the loan chat that one of their files wasn't accepted, and why.
+
+        For a file sent against a request, the message is posted as that request's card (the
+        request's chat message moves to it), so the borrower can upload a new version right from
+        it. Internal files and files with no loan (e.g. a shared blank form) are skipped.
+        """
+        if document.loan_id is None or not document.visible_to_borrower:
+            return
+        doc_request = document.request
+        lines = [
+            f'Your file "{document.name}"'
+            + (f' for "{doc_request.name}"' if doc_request else "")
+            + " was not accepted."
+        ]
+        if note:
+            lines.append(f"Reason: {note}")
+        lines.append("Please upload a new version." if doc_request else "Please send a corrected file.")
+        chat = ChatService.ensure_loan_chat(document.loan)
+        if doc_request is None:
+            ChatService.send_message(chat, reviewer, "\n".join(lines))
+        else:
+            ChatService.send_message(
+                chat, reviewer, "\n".join(lines), kind=Message.Kind.DOCUMENT_REQUEST, document_request=doc_request,
+            )
 
     @staticmethod
     @transaction.atomic
