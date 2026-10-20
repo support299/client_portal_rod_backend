@@ -23,4 +23,5 @@ urlpatterns = [
     path('crm/', include('ghl.urls')),
     path('api/auth/', include('accounts.urls')),
     path('api/loans/', include('loan.urls')),
+    path('api/chats/', include('chats.urls')),
 ]

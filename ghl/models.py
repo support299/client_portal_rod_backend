@@ -14,6 +14,8 @@ class GHLToken(models.Model):
     refresh_token = models.TextField()
     expires_at = models.DateTimeField()
     scope = models.TextField(blank=True)
+    # Location tokens only: the GHL media folder that holds this location's loan documents.
+    media_folder_id = models.CharField(max_length=64, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

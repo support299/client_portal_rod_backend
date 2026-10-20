@@ -38,6 +38,7 @@ CORS_ALLOW_CREDENTIALS = True
 # Application definition
 
 INSTALLED_APPS = [
+    'daphne',  # first, so runserver serves the ASGI app (websockets included)
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -50,6 +51,7 @@ INSTALLED_APPS = [
     'webhook',
     'accounts',
     'loan',
+    'chats',
 ]
 
 AUTH_USER_MODEL = 'accounts.User'
@@ -95,6 +97,15 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'config.wsgi.application'
+ASGI_APPLICATION = 'config.asgi.application'
+
+# Channels: chat events are fanned out to each user's open websockets through Redis.
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {'hosts': [config('CHANNELS_REDIS_URL', default='redis://localhost:6379/1')]},
+    },
+}
 
 
 # Database
