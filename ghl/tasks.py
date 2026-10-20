@@ -6,7 +6,9 @@ from loan.services import LoanService
 
 from .client import GHLAuthError, get_access_token
 from .models import GHLToken
-from .services import AccountLinkService, ContactService, GHLAPIError, OpportunityService, UserService
+from .services import (
+    AccountLinkService, ContactService, GHLAPIError, GHLService, MediaService, OpportunityService, UserService,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +59,20 @@ def sync_ghl_location(self, location_id):
     loans, skipped = LoanService.ensure_pipeline_loans()
     # Picks up GHL reassignments, and GHL users who only now got linked to a login.
     LoanService.add_ghl_assignees()
+    # Find (or create) the documents folder now, so the first upload doesn't have to. A failure
+    # here (e.g. the app lacks the media scopes) mustn't undo the sync; uploads try again.
+    try:
+        media_folder = MediaService.ensure_folder(GHLService.token_for_location(location_id))
+    except (GHLAuthError, GHLAPIError, GHLToken.DoesNotExist) as exc:
+        logger.warning('No media folder for location %s: %s', location_id, exc)
+        media_folder = None
     logger.info('Synced %d user(s), %d contact(s) and %d opportunity(ies) for location %s; '
-                'created %d login(s), %d loan(s), skipped %d',
-                users, contacts, opportunities, location_id, len(accounts), len(loans), len(skipped))
+                'created %d login(s), %d loan(s), skipped %d; media folder %s',
+                users, contacts, opportunities, location_id, len(accounts), len(loans), len(skipped),
+                media_folder)
     return {'users': users, 'contacts': contacts, 'opportunities': opportunities,
-            'accounts_created': len(accounts), 'loans_created': len(loans), 'loans_skipped': len(skipped)}
+            'accounts_created': len(accounts), 'loans_created': len(loans), 'loans_skipped': len(skipped),
+            'media_folder': media_folder}
 
 
 @shared_task

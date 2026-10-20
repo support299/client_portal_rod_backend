@@ -1,7 +1,9 @@
 import logging
+import os
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.db.models import Exists, OuterRef, Subquery
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
@@ -589,3 +591,113 @@ class AccountLinkService:
             )
             if ghl_user:
                 GHLUser.objects.filter(pk=ghl_user.pk).update(account=user)
+
+
+class MediaService:
+    """The location's GHL media library, where loan documents are stored.
+
+    Every location keeps them in one top-level folder, found by name before it is ever created,
+    so a re-onboarded location or a wiped database reuses the folder already in GHL. Its id is
+    cached on the location's GHLToken (media_folder_id); GHL stays the source of truth.
+    """
+
+    FOLDER_NAME = "Loan Dashboard Documents"
+    # Uploads are named "<opportunity id>__<file name>": opportunity ids come from GHL and never
+    # change, so each file can be matched back to its loan even after a database wipe.
+    NAME_SEPARATOR = "__"
+    PAGE_LIMIT = 100
+
+    @staticmethod
+    def media_name(opportunity_id, filename):
+        return f"{opportunity_id}{MediaService.NAME_SEPARATOR}{os.path.basename(filename)}"
+
+    @staticmethod
+    def parse_media_name(name):
+        """(opportunity id, original file name) for a name made by media_name, else (None, name)."""
+        prefix, sep, rest = (name or "").partition(MediaService.NAME_SEPARATOR)
+        # GHL ids are 20 alphanumeric characters; a shorter prefix is part of someone's file name.
+        if sep and rest and prefix.isalnum() and len(prefix) >= 15:
+            return prefix, rest
+        return None, name
+
+    @staticmethod
+    def list_files(token, **params):
+        """One page of the location's media library (files and/or folders)."""
+        params = {"altId": token.location_id, "altType": "location", "limit": MediaService.PAGE_LIMIT, **params}
+        return GHLService.json(api_request(token, "GET", "/medias/files", params=params)).get("files", [])
+
+    @staticmethod
+    def find_folder(token):
+        """Our folder's id at the top of the media library, or None; the oldest if there are several."""
+        folders = [
+            f for f in MediaService.list_files(
+                token, type="folder", query=MediaService.FOLDER_NAME, sortBy="createdAt", sortOrder="asc",
+            )
+            # The search is a partial match, so keep exact top-level matches only.
+            if f.get("name") == MediaService.FOLDER_NAME and not f.get("parentId") and not f.get("deleted")
+        ]
+        if len(folders) > 1:
+            logger.warning("Location %s has %d %r folders; using the oldest (%s)",
+                           token.location_id, len(folders), MediaService.FOLDER_NAME, folders[0]["_id"])
+        return folders[0]["_id"] if folders else None
+
+    @staticmethod
+    def create_folder(token):
+        data = GHLService.json(api_request(token, "POST", "/medias/folder", json={
+            "altId": token.location_id,
+            "altType": "location",
+            "name": MediaService.FOLDER_NAME,
+        }))
+        folder_id = data.get("_id") or data.get("id")
+        if not folder_id:
+            raise GHLAPIError(200, {"error": "GHL created a folder but returned no id", "response": data})
+        logger.info("Created media folder %s for location %s", folder_id, token.location_id)
+        return folder_id
+
+    @staticmethod
+    def ensure_folder(token, refresh=False):
+        """Return the location's folder id: the cached one, else found in GHL, else created there.
+
+        refresh=True drops the cached id first (e.g. the folder was deleted in GHL).
+        """
+        if token.media_folder_id and not refresh:
+            return token.media_folder_id
+        stale = token.media_folder_id
+        with transaction.atomic():
+            # Locked so two first uploads don't both create a folder.
+            locked = GHLToken.objects.select_for_update().get(pk=token.pk)
+            # Skip if another request already looked it up again meanwhile.
+            if not locked.media_folder_id or (refresh and locked.media_folder_id == stale):
+                locked.media_folder_id = MediaService.find_folder(locked) or MediaService.create_folder(locked)
+                locked.save(update_fields=["media_folder_id", "updated_at"])
+        token.media_folder_id = locked.media_folder_id
+        return token.media_folder_id
+
+    @staticmethod
+    def is_invalid_file_type(exc):
+        """True when GHL refused an upload because of the file's type (not a folder problem)."""
+        return isinstance(exc.body, dict) and exc.body.get("code") == "INVALID_FILE_TYPE"
+
+    @staticmethod
+    def upload(token, file, filename, content_type, opportunity_id):
+        """Upload a file object into the location's folder as media_name(opportunity_id, filename).
+
+        Returns GHL's response ({fileId, url}). If GHL rejects the folder (deleted there), the
+        folder is found or created again and the upload retried once.
+        """
+        name = MediaService.media_name(opportunity_id, filename)
+        for attempt in range(2):
+            folder_id = MediaService.ensure_folder(token, refresh=attempt > 0)
+            try:
+                return GHLService.json(api_request(
+                    token, "POST", "/medias/upload-file",
+                    data={"name": name, "hosted": "false", "parentId": folder_id},
+                    files={"file": (name, file, content_type or "application/octet-stream")},
+                    timeout=120,
+                ))
+            except GHLAPIError as exc:
+                if attempt or exc.status_code not in (400, 404) or MediaService.is_invalid_file_type(exc):
+                    raise
+                logger.warning("Upload to media folder %s failed (%s); looking the folder up again",
+                               folder_id, exc.status_code)
+                file.seek(0)

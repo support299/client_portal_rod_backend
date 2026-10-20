@@ -1,13 +1,18 @@
 import logging
+import os
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.db.models import Exists, OuterRef, Subquery
+from django.utils import timezone
 
+from chats.models import Message
+from chats.services import ChatService
 from ghl.models import GHLOpportunity, GHLUser
+from ghl.services import GHLAPIError, GHLService, MediaService
 
-from .models import Loan, LoanOfficer
+from .models import DocumentRequest, DocumentType, Loan, LoanDocument, LoanOfficer
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +116,7 @@ class LoanService:
             created_by=created_by,
         )
         LoanService.add_ghl_assignee(loan)
+        DocumentService.request_defaults(loan, requested_by=created_by)
         return loan, borrower_created
 
     @staticmethod
@@ -157,3 +163,177 @@ class LoanService:
             if loan:
                 created.append(loan)
         return created, skipped
+
+
+class DocumentError(Exception):
+    pass
+
+
+class DocumentService:
+    """Loan documents: the files live in the location's GHL media (see MediaService), metadata here."""
+
+    MAX_UPLOAD_SIZE = 25 * 1024 * 1024
+    # Media name prefix for blank forms, which belong to a document type rather than a loan.
+    TEMPLATE_PREFIX = "template"
+
+    @staticmethod
+    def push_to_ghl(location_id, file, prefix):
+        """Upload an UploadedFile to the location's GHL media; returns the LoanDocument fields for it.
+
+        Call it outside a transaction: the upload can take a while, and if saving fails
+        afterwards the file just stays in GHL media.
+        """
+        token = GHLService.token_for_location(location_id)
+        data = MediaService.upload(token, file, file.name, file.content_type, prefix)
+        file_id = data.get("fileId") or data.get("_id")
+        if not file_id or not data.get("url"):
+            raise GHLAPIError(200, {"error": "GHL stored the file but returned no id or url", "response": data})
+        return {
+            "ghl_media_id": file_id,
+            "ghl_folder_id": token.media_folder_id or "",
+            "location_id": location_id,
+            "url": data["url"],
+            "name": os.path.basename(file.name)[:255],
+            "content_type": (file.content_type or "")[:100],
+            "size": file.size,
+            "raw": data,
+            "uploaded_at": timezone.now(),
+        }
+
+    @staticmethod
+    def upload(loan, file, user, doc_request=None, document_type=None,
+               direction=LoanDocument.Direction.BORROWER_UPLOAD, visible_to_borrower=True):
+        """Store a file for a loan. A borrower file sent against a request puts the request in review."""
+        fields = DocumentService.push_to_ghl(loan.opportunity.location_id, file, loan.opportunity_id)
+        with transaction.atomic():
+            document = LoanDocument.objects.create(
+                loan=loan,
+                request=doc_request,
+                document_type=document_type or (doc_request.document_type if doc_request else None),
+                direction=direction,
+                visible_to_borrower=visible_to_borrower,
+                origin=LoanDocument.Origin.APP,
+                uploaded_by=user,
+                **fields,
+            )
+            if doc_request is not None and direction == LoanDocument.Direction.BORROWER_UPLOAD:
+                doc_request.status = DocumentRequest.Status.PENDING_REVIEW
+                doc_request.save(update_fields=["status", "updated_at"])
+        return document
+
+    @staticmethod
+    def upload_template(file):
+        """Push a document type's blank form to GHL media; pass the result to set_template."""
+        location_id = (
+            GHLOpportunity.objects.filter(pipeline_id=settings.LOAN_PIPELINE_ID)
+            .values_list("location_id", flat=True).first()
+        )
+        if not location_id:
+            raise DocumentError("No GHL location has the loan pipeline yet; sync GHL first.")
+        return DocumentService.push_to_ghl(location_id, file, DocumentService.TEMPLATE_PREFIX)
+
+    @staticmethod
+    @transaction.atomic
+    def set_template(document_type, fields, user):
+        """Make an uploaded blank form (from upload_template) the type's template.
+
+        The form is a LoanDocument with no loan, shared by every request of the type; an old
+        template keeps its row, since earlier requests still point at it.
+        """
+        LoanDocument.objects.create(
+            document_type=document_type,
+            direction=LoanDocument.Direction.LENDER_SHARE,
+            origin=LoanDocument.Origin.APP,
+            uploaded_by=user,
+            **fields,
+        )
+        document_type.template_ghl_media_id = fields["ghl_media_id"]
+        document_type.template_name = fields["name"]
+        document_type.save(update_fields=["template_ghl_media_id", "template_name"])
+
+    @staticmethod
+    def request_message(doc_request):
+        lines = [f"Document requested: {doc_request.name}"]
+        if doc_request.description:
+            lines.append(doc_request.description)
+        if doc_request.kind == DocumentType.Kind.FILL_FORM:
+            lines.append("Fill in the shared form and upload it.")
+        if doc_request.due_date:
+            lines.append(f"Due {doc_request.due_date:%b %d, %Y}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def create_request(loan, requested_by, name, document_type=None, kind=None, description="",
+                       due_date=None, source=DocumentRequest.Source.MANUAL, form_file=None):
+        """Ask the borrower for a document and post the request in the loan chat.
+
+        A fill_form request shares form_file if given, else the type's template.
+        """
+        kind = kind or (document_type.kind if document_type else DocumentType.Kind.UPLOAD)
+        form = None
+        if form_file is not None:
+            form = DocumentService.upload(loan, form_file, requested_by, document_type=document_type,
+                                          direction=LoanDocument.Direction.LENDER_SHARE)
+        elif kind == DocumentType.Kind.FILL_FORM and document_type and document_type.template_ghl_media_id:
+            form = LoanDocument.objects.filter(ghl_media_id=document_type.template_ghl_media_id).first()
+        with transaction.atomic():
+            doc_request = DocumentRequest.objects.create(
+                loan=loan,
+                document_type=document_type,
+                name=name,
+                description=description,
+                kind=kind,
+                form_document=form,
+                source=source,
+                due_date=due_date,
+                requested_by=requested_by,
+            )
+            doc_request.message = ChatService.send_message(
+                ChatService.ensure_loan_chat(loan), requested_by,
+                DocumentService.request_message(doc_request), kind=Message.Kind.DOCUMENT_REQUEST,
+            )
+            doc_request.save(update_fields=["message", "updated_at"])
+        return doc_request
+
+    @staticmethod
+    def request_defaults(loan, requested_by=None):
+        """Request every active default document type (the checklist) for a new loan."""
+        for document_type in DocumentType.objects.filter(is_default=True, is_active=True):
+            DocumentService.create_request(
+                loan, requested_by, document_type.name, document_type=document_type,
+                description=document_type.description, source=DocumentRequest.Source.CHECKLIST,
+            )
+
+    @staticmethod
+    @transaction.atomic
+    def review(document, review_status, user, note=None):
+        """Accept or reject a file; its request follows (accepted: uploaded, rejected: needs revision)."""
+        reviewed = review_status != LoanDocument.ReviewStatus.UNREVIEWED
+        document.review_status = review_status
+        document.reviewed_by = user if reviewed else None
+        document.reviewed_at = timezone.now() if reviewed else None
+        document.save(update_fields=["review_status", "reviewed_by", "reviewed_at"])
+        doc_request = document.request
+        if doc_request is None or not reviewed:
+            return
+        doc_request.status = (
+            DocumentRequest.Status.UPLOADED if review_status == LoanDocument.ReviewStatus.ACCEPTED
+            else DocumentRequest.Status.NEEDS_REVISION
+        )
+        doc_request.reviewed_by = user
+        doc_request.reviewed_at = document.reviewed_at
+        if note is not None:
+            doc_request.reviewer_note = note
+        doc_request.save(update_fields=["status", "reviewed_by", "reviewed_at", "reviewer_note", "updated_at"])
+
+    @staticmethod
+    @transaction.atomic
+    def delete(document):
+        """Hide a file (it stays in GHL media); a request left with no files goes back to requested."""
+        document.is_deleted = True
+        document.save(update_fields=["is_deleted"])
+        doc_request = document.request
+        if (doc_request and doc_request.status == DocumentRequest.Status.PENDING_REVIEW
+                and not doc_request.documents.filter(is_deleted=False).exists()):
+            doc_request.status = DocumentRequest.Status.REQUESTED
+            doc_request.save(update_fields=["status", "updated_at"])
