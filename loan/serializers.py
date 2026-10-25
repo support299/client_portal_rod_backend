@@ -4,7 +4,8 @@ from rest_framework import serializers
 from accounts.models import User
 from accounts.serializers import UserSerializer
 
-from .models import DocumentRequest, DocumentType, Loan, LoanDocument
+from .draw_services import DrawService
+from .models import DocumentRequest, DocumentType, DrawRequest, DrawRequestStatusChange, Loan, LoanDocument
 from .services import DocumentService
 
 
@@ -47,7 +48,8 @@ class LoanSerializer(serializers.ModelSerializer):
             "id", "opportunity", "contact", "borrower", "loan_officers", "loan_officer", "status", "status_label",
             "name", "loan_amount", "location_id", "pipeline_id", "pipeline_name",
             "pipeline_stage_id", "stage_name", "opportunity_status", "source", "assigned_to",
-            "lost_reason_id", "expected_close_date", "custom_fields", "created_by", "created_at", "updated_at",
+            "lost_reason_id", "expected_close_date", "custom_fields", "holdback_amount", "created_by",
+            "created_at", "updated_at",
         ]
         read_only_fields = fields
 
@@ -74,7 +76,7 @@ class BorrowerLoanSerializer(serializers.ModelSerializer):
     class Meta:
         model = Loan
         fields = [
-            "id", "name", "loan_amount", "status", "status_label", "expected_close_date",
+            "id", "name", "loan_amount", "status", "status_label", "expected_close_date", "holdback_amount",
             "loan_officers", "loan_officer", "created_at", "updated_at",
         ]
         read_only_fields = fields
@@ -83,7 +85,7 @@ class BorrowerLoanSerializer(serializers.ModelSerializer):
 class LoanUpdateSerializer(serializers.ModelSerializer):
     """Editable loan fields. The officers may only be changed by admins (enforced in validate).
 
-    loan_officers is saved on the loan; name, loan_amount, expected_close_date and
+    loan_officers and holdback_amount are saved on the loan; name, loan_amount, expected_close_date and
     main_officer (as assigned_to) belong to the opportunity and are pushed to GHL by the view
     (see LoanDetailView).
     """
@@ -106,11 +108,29 @@ class LoanUpdateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Loan
-        fields = ["name", "loan_amount", "expected_close_date", "loan_officers", "loan_officer", "main_officer"]
+        fields = [
+            "name", "loan_amount", "expected_close_date", "holdback_amount", "loan_officers", "loan_officer",
+            "main_officer",
+        ]
 
     def validate_loan_amount(self, value):
         if value < 0:
             raise serializers.ValidationError("Loan amount can't be negative.")
+        return value
+
+    def validate_holdback_amount(self, value):
+        if value is None:
+            if self.instance.draws.filter(is_deleted=False).exists():
+                raise serializers.ValidationError("This loan has draws, so its holdback can't be removed.")
+            return value
+        if value < 0:
+            raise serializers.ValidationError("Holdback can't be negative.")
+        committed = self.instance.draw_summary()
+        committed = committed["redeemed"] + committed["in_progress"]
+        if value < committed:
+            raise serializers.ValidationError(
+                f"Draws already take ${committed:,.2f} of this loan, so the holdback can't be less."
+            )
         return value
 
     def validate(self, attrs):
@@ -198,7 +218,7 @@ class LoanDocumentSerializer(serializers.ModelSerializer):
     class Meta:
         model = LoanDocument
         fields = [
-            "id", "loan", "request", "document_type", "document_type_name", "direction",
+            "id", "loan", "request", "draw", "document_type", "document_type_name", "direction",
             "visible_to_borrower", "origin", "review_status", "reviewed_by", "reviewed_at",
             "name", "content_type", "size", "uploaded_by", "uploaded_at", "download_url",
         ]
@@ -224,6 +244,10 @@ class LoanDocumentUploadSerializer(serializers.Serializer):
     request = serializers.PrimaryKeyRelatedField(
         queryset=DocumentRequest.objects.filter(is_deleted=False), required=False, allow_null=True,
     )
+    # A draw's photos, invoices, lien waivers or inspection report.
+    draw = serializers.PrimaryKeyRelatedField(
+        queryset=DrawRequest.objects.filter(is_deleted=False), required=False, allow_null=True,
+    )
     document_type = serializers.PrimaryKeyRelatedField(
         queryset=DocumentType.objects.filter(is_active=True), required=False, allow_null=True,
     )
@@ -232,6 +256,11 @@ class LoanDocumentUploadSerializer(serializers.Serializer):
 
     def validate_request(self, value):
         return validate_same_loan(self, value)
+
+    def validate_draw(self, value):
+        if value is not None and value.loan_id != self.context["loan"].pk:
+            raise serializers.ValidationError("That draw belongs to another loan.")
+        return value
 
     def validate(self, attrs):
         user = self.context["request"].user
@@ -340,3 +369,95 @@ class DocumentRequestUpdateSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         return DocumentRequestSerializer(instance, context=self.context).data
+
+
+class DrawStatusChangeSerializer(serializers.ModelSerializer):
+    changed_by = DocumentUserSerializer(read_only=True)
+
+    class Meta:
+        model = DrawRequestStatusChange
+        fields = ["id", "from_status", "to_status", "amount_approved", "changed_by", "changed_at", "note"]
+        read_only_fields = fields
+
+
+class DrawRequestSerializer(serializers.ModelSerializer):
+    """A draw with its files and status history. Expects files prefetched into active_files.
+
+    allowed_statuses lists what the requesting user may move it to (see DrawService).
+    """
+
+    submitted_by = DocumentUserSerializer(read_only=True)
+    files = serializers.SerializerMethodField()
+    status_changes = DrawStatusChangeSerializer(many=True, read_only=True)
+    allowed_statuses = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DrawRequest
+        fields = [
+            "id", "loan", "number", "status", "amount_requested", "amount_approved", "borrower_comment",
+            "staff_note", "inspector", "inspection_date", "funding_reference", "submitted_by",
+            "submitted_at", "message", "updated_at", "allowed_statuses", "files", "status_changes",
+        ]
+        read_only_fields = fields
+
+    def get_files(self, obj):
+        return LoanDocumentSerializer(obj.active_files, many=True, context=self.context).data
+
+    def get_allowed_statuses(self, obj):
+        return DrawService.allowed_transitions(obj, self.context["request"].user)
+
+
+class DrawRequestCreateSerializer(serializers.Serializer):
+    """POST body for a new draw; files are uploaded afterwards to the loan's documents with draw=<id>."""
+
+    amount_requested = serializers.DecimalField(max_digits=14, decimal_places=2)
+    borrower_comment = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class DrawRequestUpdateSerializer(serializers.ModelSerializer):
+    """Edits to a draw's details; status changes go through DrawStatusSerializer.
+
+    Borrowers may only change amount_requested and borrower_comment, and only while the draw
+    is submitted or needs info. Staff may change everything here.
+    """
+
+    BORROWER_FIELDS = {"amount_requested", "borrower_comment"}
+
+    class Meta:
+        model = DrawRequest
+        fields = [
+            "amount_requested", "amount_approved", "borrower_comment", "staff_note", "inspector",
+            "inspection_date", "funding_reference",
+        ]
+
+    def validate(self, attrs):
+        user = self.context["request"].user
+        if user.role == User.Role.BORROWER:
+            if set(attrs) - self.BORROWER_FIELDS:
+                raise serializers.ValidationError("You can only change the amount and your comment.")
+            if self.instance.status not in DrawService.BORROWER_EDITABLE:
+                raise serializers.ValidationError("This draw is being reviewed and can't be changed now.")
+        return attrs
+
+    def update(self, instance, validated_data):
+        return DrawService.update(instance, **validated_data)
+
+    def to_representation(self, instance):
+        return DrawRequestSerializer(instance, context=self.context).data
+
+
+class DrawStatusSerializer(serializers.Serializer):
+    """POST body to move a draw: status, and optionally a note (the reason, logged and posted in
+    chat), amount_approved (staff, needed to approve) and funding_reference (staff, on funding).
+    """
+
+    status = serializers.ChoiceField(choices=DrawRequest.Status.choices)
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+    amount_approved = serializers.DecimalField(max_digits=14, decimal_places=2, required=False)
+    funding_reference = serializers.CharField(max_length=100, required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        user = self.context["request"].user
+        if user.role == User.Role.BORROWER and ({"amount_approved", "funding_reference"} & set(attrs)):
+            raise serializers.ValidationError("Only staff can set the approved amount or funding reference.")
+        return attrs

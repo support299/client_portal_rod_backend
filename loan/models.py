@@ -1,5 +1,9 @@
+from decimal import Decimal
+
 from django.conf import settings
 from django.db import models
+from django.db.models import Sum
+from django.db.models.functions import Coalesce
 from django.utils.functional import cached_property
 
 from ghl.models import GHLUser
@@ -28,6 +32,9 @@ class Loan(models.Model):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="+",
     )
+    # Total construction money released through draws; entered in the app, not synced to GHL.
+    # Null for loans with no draws. Draws never change it: redeemed/remaining come from draw_summary.
+    holdback_amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
     is_deleted = models.BooleanField(default=False, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -67,6 +74,32 @@ class Loan(models.Model):
         """The first officer, i.e. the GHL assignee when they're on the loan (single-officer view of loan_officers)."""
         officers = self.loan_officers
         return officers[0] if officers else None
+
+    def draw_summary(self, exclude=None):
+        """Holdback, redeemed, in-progress and available amounts, calculated from the draws.
+
+        Redeemed is approved amounts on funded draws; in progress is open draws, at their approved
+        amount once set, else the requested amount. Available is None when there's no holdback.
+        exclude leaves out one draw, to check whether a change to it still fits.
+        """
+        draws = self.draws.filter(is_deleted=False)
+        if exclude is not None:
+            draws = draws.exclude(pk=exclude.pk)
+        redeemed = draws.filter(status=DrawRequest.Status.FUNDED).aggregate(
+            total=Sum("amount_approved"),
+        )["total"] or Decimal("0")
+        in_progress = draws.filter(status__in=DrawRequest.OPEN_STATUSES).aggregate(
+            total=Sum(Coalesce("amount_approved", "amount_requested")),
+        )["total"] or Decimal("0")
+        available = None
+        if self.holdback_amount is not None:
+            available = self.holdback_amount - redeemed - in_progress
+        return {
+            "holdback": self.holdback_amount,
+            "redeemed": redeemed,
+            "in_progress": in_progress,
+            "available": available,
+        }
 
 
 class LoanOfficer(models.Model):
@@ -177,6 +210,95 @@ class DocumentRequest(models.Model):
         return f"{self.name} ({self.loan})"
 
 
+class DrawRequest(models.Model):
+    """A borrower's request for money from the loan's holdback; its files are LoanDocuments.
+
+    Change status only through the service so every change is logged in DrawRequestStatusChange.
+    """
+
+    class Status(models.TextChoices):
+        SUBMITTED = "submitted", "Submitted"
+        NEEDS_INFO = "needs_info", "Needs Info"
+        INSPECTION_ORDERED = "inspection_ordered", "Inspection Ordered"
+        INSPECTED = "inspected", "Inspected"
+        APPROVED = "approved", "Approved"
+        FUNDED = "funded", "Funded"
+        REJECTED = "rejected", "Rejected"
+        CANCELLED = "cancelled", "Cancelled"
+
+    # Draws still holding money back from the holdback.
+    OPEN_STATUSES = [
+        Status.SUBMITTED, Status.NEEDS_INFO, Status.INSPECTION_ORDERED, Status.INSPECTED,
+        Status.APPROVED,
+    ]
+
+    loan = models.ForeignKey(Loan, on_delete=models.CASCADE, related_name="draws")
+    # Draw #1, #2, ... per loan.
+    number = models.PositiveIntegerField()
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.SUBMITTED, db_index=True,
+    )
+    amount_requested = models.DecimalField(max_digits=14, decimal_places=2)
+    # Can be less than requested, based on the inspection; counts as redeemed once funded.
+    amount_approved = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    borrower_comment = models.TextField(blank=True)
+    # Shown to the borrower on needs_info / rejected.
+    staff_note = models.TextField(blank=True)
+    inspector = models.CharField(max_length=255, blank=True)
+    inspection_date = models.DateField(null=True, blank=True)
+    # Wire / ACH reference.
+    funding_reference = models.CharField(max_length=100, blank=True)
+    # The borrower, or staff submitting for them.
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="+",
+    )
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    # The draw's card in the loan chat; moves to the newest status message.
+    message = models.ForeignKey(
+        "chats.Message", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="draw_requests",
+    )
+    is_deleted = models.BooleanField(default=False, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["loan", "number"]
+        constraints = [
+            models.UniqueConstraint(fields=["loan", "number"], name="unique_draw_number"),
+        ]
+
+    def __str__(self):
+        return f"Draw #{self.number} ({self.loan})"
+
+
+class DrawRequestStatusChange(models.Model):
+    """One status change on a draw, e.g. approved -> inspected when an approval is undone.
+
+    Append-only: rows are never edited or deleted.
+    """
+
+    draw = models.ForeignKey(DrawRequest, on_delete=models.CASCADE, related_name="status_changes")
+    # Blank on the first row, when the draw is submitted.
+    from_status = models.CharField(max_length=20, choices=DrawRequest.Status.choices, blank=True)
+    to_status = models.CharField(max_length=20, choices=DrawRequest.Status.choices)
+    # The draw's approved amount at the time of the change.
+    amount_approved = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="+",
+    )
+    changed_at = models.DateTimeField(auto_now_add=True)
+    # Why it changed, e.g. "Wrong amount, re-checking HVAC".
+    note = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["changed_at", "id"]
+
+    def __str__(self):
+        return f"{self.draw}: {self.from_status or '-'} -> {self.to_status}"
+
+
 class LoanDocument(models.Model):
     """A file stored in GHL media; only its metadata and link are kept here.
 
@@ -204,6 +326,10 @@ class LoanDocument(models.Model):
     )
     request = models.ForeignKey(
         DocumentRequest, on_delete=models.SET_NULL, null=True, blank=True, related_name="documents",
+    )
+    # Photos, invoices, lien waivers and inspection reports for a draw; document_type says which.
+    draw = models.ForeignKey(
+        DrawRequest, on_delete=models.SET_NULL, null=True, blank=True, related_name="files",
     )
     message = models.ForeignKey(
         "chats.Message", on_delete=models.SET_NULL, null=True, blank=True, related_name="attachments",

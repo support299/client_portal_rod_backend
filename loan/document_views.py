@@ -124,7 +124,7 @@ class DocumentTypeSaveMixin:
 
     def save_type(self, serializer):
         template = serializer.validated_data.pop("template_file", None)
-        fields = DocumentService.upload_template(template) if template else None
+        fields = DocumentService.upload_template(template, self.request.user) if template else None
         with transaction.atomic():
             document_type = serializer.save()
             if fields:
@@ -264,8 +264,8 @@ class DocumentRequestDetailView(LoanScopedMixin, StaffWritesMixin, RetrieveUpdat
 class LoanDocumentListView(LoanScopedMixin, ListCreateAPIView):
     """GET a loan's files (borrowers see only those visible to them); POST (multipart) uploads one.
 
-    Query params (all optional): request, direction, review_status, document_type.
-    POST body: file, and optionally request, document_type, direction and visible_to_borrower
+    Query params (all optional): request, draw, direction, review_status, document_type.
+    POST body: file, and optionally request, draw, document_type, direction and visible_to_borrower
     (see LoanDocumentUploadSerializer). The file is stored in GHL media (502 if GHL fails).
     """
 
@@ -280,7 +280,7 @@ class LoanDocumentListView(LoanScopedMixin, ListCreateAPIView):
     def get_queryset(self):
         qs = loan_documents(self.loan, self.request.user)
         params = self.request.query_params
-        for field in ("request", "direction", "review_status", "document_type"):
+        for field in ("request", "draw", "direction", "review_status", "document_type"):
             if params.get(field):
                 qs = qs.filter(**{field: params[field]})
         return qs
@@ -293,6 +293,7 @@ class LoanDocumentListView(LoanScopedMixin, ListCreateAPIView):
             document = DocumentService.upload(
                 self.loan, data["file"], request.user,
                 doc_request=data.get("request"),
+                draw=data.get("draw"),
                 document_type=data.get("document_type"),
                 direction=data["direction"],
                 visible_to_borrower=data["visible_to_borrower"],

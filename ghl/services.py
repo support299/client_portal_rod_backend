@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -9,7 +10,7 @@ from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 
 from .client import api_request, get_location_token
-from .models import GHLContact, GHLOpportunity, GHLPipelineStage, GHLToken, GHLUser
+from .models import GHLContact, GHLOpportunity, GHLOutboundLog, GHLPipelineStage, GHLToken, GHLUser
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,44 @@ class GHLService:
                 body = resp.text
             raise GHLAPIError(resp.status_code, body)
         return resp.json()
+
+    @staticmethod
+    def logged_request(token, method, endpoint, action, triggered_by=None, object_id="", log_body=None, **kwargs):
+        """api_request + json(), recorded in GHLOutboundLog, failures included.
+
+        log_body is stored as the request body (default: the json payload), e.g. a file
+        upload's metadata instead of its bytes. Without object_id, the id GHL returns is logged.
+        Note: inside a transaction that rolls back, the log row is rolled back too.
+        """
+        log = GHLOutboundLog(
+            action=action,
+            object_id=object_id,
+            location_id=token.location_id or "",
+            triggered_by=triggered_by,
+            method=method,
+            endpoint=endpoint,
+            request_body=log_body if log_body is not None else kwargs.get("json"),
+        )
+        started = time.monotonic()
+        try:
+            resp = api_request(token, method, endpoint, **kwargs)
+            log.http_status = resp.status_code
+            try:
+                log.response_body = resp.json()
+            except ValueError:
+                log.response_body = {"text": resp.text[:2000]}
+            data = GHLService.json(resp)
+            log.success = True
+            return data
+        except Exception as exc:
+            log.error = str(exc)
+            raise
+        finally:
+            log.duration_ms = int((time.monotonic() - started) * 1000)
+            body = log.response_body if isinstance(log.response_body, dict) else {}
+            if not log.object_id:
+                log.object_id = str(body.get("fileId") or body.get("_id") or body.get("id") or "")[:64]
+            log.save()
 
     @staticmethod
     def token_for_location(location_id):
@@ -642,12 +681,11 @@ class MediaService:
         return folders[0]["_id"] if folders else None
 
     @staticmethod
-    def create_folder(token):
-        data = GHLService.json(api_request(token, "POST", "/medias/folder", json={
-            "altId": token.location_id,
-            "altType": "location",
-            "name": MediaService.FOLDER_NAME,
-        }))
+    def create_folder(token, triggered_by=None):
+        data = GHLService.logged_request(
+            token, "POST", "/medias/folder", "media.folder_create", triggered_by=triggered_by,
+            json={"altId": token.location_id, "altType": "location", "name": MediaService.FOLDER_NAME},
+        )
         folder_id = data.get("_id") or data.get("id")
         if not folder_id:
             raise GHLAPIError(200, {"error": "GHL created a folder but returned no id", "response": data})
@@ -655,10 +693,11 @@ class MediaService:
         return folder_id
 
     @staticmethod
-    def ensure_folder(token, refresh=False):
+    def ensure_folder(token, refresh=False, triggered_by=None):
         """Return the location's folder id: the cached one, else found in GHL, else created there.
 
         refresh=True drops the cached id first (e.g. the folder was deleted in GHL).
+        triggered_by: the user logged on a folder creation.
         """
         if token.media_folder_id and not refresh:
             return token.media_folder_id
@@ -668,7 +707,9 @@ class MediaService:
             locked = GHLToken.objects.select_for_update().get(pk=token.pk)
             # Skip if another request already looked it up again meanwhile.
             if not locked.media_folder_id or (refresh and locked.media_folder_id == stale):
-                locked.media_folder_id = MediaService.find_folder(locked) or MediaService.create_folder(locked)
+                locked.media_folder_id = (
+                    MediaService.find_folder(locked) or MediaService.create_folder(locked, triggered_by)
+                )
                 locked.save(update_fields=["media_folder_id", "updated_at"])
         token.media_folder_id = locked.media_folder_id
         return token.media_folder_id
@@ -679,22 +720,26 @@ class MediaService:
         return isinstance(exc.body, dict) and exc.body.get("code") == "INVALID_FILE_TYPE"
 
     @staticmethod
-    def upload(token, file, filename, content_type, opportunity_id):
+    def upload(token, file, filename, content_type, opportunity_id, triggered_by=None):
         """Upload a file object into the location's folder as media_name(opportunity_id, filename).
 
         Returns GHL's response ({fileId, url}). If GHL rejects the folder (deleted there), the
-        folder is found or created again and the upload retried once.
+        folder is found or created again and the upload retried once. Each attempt is logged in
+        GHLOutboundLog (the file's metadata, not its bytes).
         """
         name = MediaService.media_name(opportunity_id, filename)
+        content_type = content_type or "application/octet-stream"
         for attempt in range(2):
-            folder_id = MediaService.ensure_folder(token, refresh=attempt > 0)
+            folder_id = MediaService.ensure_folder(token, refresh=attempt > 0, triggered_by=triggered_by)
+            fields = {"name": name, "hosted": "false", "parentId": folder_id}
             try:
-                return GHLService.json(api_request(
-                    token, "POST", "/medias/upload-file",
-                    data={"name": name, "hosted": "false", "parentId": folder_id},
-                    files={"file": (name, file, content_type or "application/octet-stream")},
+                return GHLService.logged_request(
+                    token, "POST", "/medias/upload-file", "media.upload", triggered_by=triggered_by,
+                    log_body={**fields, "content_type": content_type, "size": getattr(file, "size", None)},
+                    data=fields,
+                    files={"file": (name, file, content_type)},
                     timeout=120,
-                ))
+                )
             except GHLAPIError as exc:
                 if attempt or exc.status_code not in (400, 404) or MediaService.is_invalid_file_type(exc):
                     raise

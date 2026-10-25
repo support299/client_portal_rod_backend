@@ -177,14 +177,15 @@ class DocumentService:
     TEMPLATE_PREFIX = "template"
 
     @staticmethod
-    def push_to_ghl(location_id, file, prefix):
+    def push_to_ghl(location_id, file, prefix, user=None):
         """Upload an UploadedFile to the location's GHL media; returns the LoanDocument fields for it.
 
-        Call it outside a transaction: the upload can take a while, and if saving fails
-        afterwards the file just stays in GHL media.
+        Call it outside a transaction: the upload can take a while, if saving fails afterwards
+        the file just stays in GHL media, and the GHLOutboundLog row (user as triggered_by)
+        survives a failed request.
         """
         token = GHLService.token_for_location(location_id)
-        data = MediaService.upload(token, file, file.name, file.content_type, prefix)
+        data = MediaService.upload(token, file, file.name, file.content_type, prefix, triggered_by=user)
         file_id = data.get("fileId") or data.get("_id")
         if not file_id or not data.get("url"):
             raise GHLAPIError(200, {"error": "GHL stored the file but returned no id or url", "response": data})
@@ -203,13 +204,16 @@ class DocumentService:
     @staticmethod
     def upload(loan, file, user, doc_request=None, document_type=None,
                direction=LoanDocument.Direction.BORROWER_UPLOAD, visible_to_borrower=True,
-               origin=LoanDocument.Origin.APP):
-        """Store a file for a loan. A borrower file sent against a request puts the request in review."""
-        fields = DocumentService.push_to_ghl(loan.opportunity.location_id, file, loan.opportunity_id)
+               origin=LoanDocument.Origin.APP, draw=None):
+        """Store a file for a loan, optionally for one of its draws. A borrower file sent against a
+        request puts the request in review.
+        """
+        fields = DocumentService.push_to_ghl(loan.opportunity.location_id, file, loan.opportunity_id, user)
         with transaction.atomic():
             document = LoanDocument.objects.create(
                 loan=loan,
                 request=doc_request,
+                draw=draw,
                 document_type=document_type or (doc_request.document_type if doc_request else None),
                 direction=direction,
                 visible_to_borrower=visible_to_borrower,
@@ -223,7 +227,7 @@ class DocumentService:
         return document
 
     @staticmethod
-    def upload_template(file):
+    def upload_template(file, user=None):
         """Push a document type's blank form to GHL media; pass the result to set_template."""
         location_id = (
             GHLOpportunity.objects.filter(pipeline_id=settings.LOAN_PIPELINE_ID)
@@ -231,7 +235,7 @@ class DocumentService:
         )
         if not location_id:
             raise DocumentError("No GHL location has the loan pipeline yet; sync GHL first.")
-        return DocumentService.push_to_ghl(location_id, file, DocumentService.TEMPLATE_PREFIX)
+        return DocumentService.push_to_ghl(location_id, file, DocumentService.TEMPLATE_PREFIX, user)
 
     @staticmethod
     @transaction.atomic
