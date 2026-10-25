@@ -3,6 +3,8 @@ from django.db.models import Max
 
 from chats.models import Message
 from chats.services import ChatService
+from notifications.models import Notification
+from notifications.services import NotificationService, loan_team_ids
 
 from .models import DrawRequest, DrawRequestStatusChange, Loan
 
@@ -96,6 +98,11 @@ class DrawService:
         )
         DrawRequestStatusChange.objects.create(draw=draw, to_status=Status.SUBMITTED, changed_by=user)
         DrawService.post_update(draw, Status.SUBMITTED, borrower_comment)
+        NotificationService.notify(
+            loan_team_ids(loan), Notification.Kind.DRAW_SUBMITTED,
+            f"Draw #{draw.number} submitted", f"${amount_requested:,.2f} requested on {loan}",
+            loan=loan, actor=user, data={"draw": draw.pk},
+        )
         return draw
 
     @staticmethod
@@ -152,6 +159,12 @@ class DrawService:
             amount_approved=draw.amount_approved, changed_by=user, note=note,
         )
         DrawService.post_update(draw, to_status, note)
+        NotificationService.notify(
+            loan_team_ids(loan), Notification.Kind.DRAW_STATUS,
+            f"Draw #{draw.number}: {Status(to_status).label}",
+            DrawService.status_message(draw, to_status, note), loan=loan, actor=user,
+            data={"draw": draw.pk, "status": to_status},
+        )
         return draw
 
     @staticmethod

@@ -167,8 +167,8 @@ class LoanDetailView(RetrieveUpdateAPIView):
             shared["assigned_to"] = main.ghl_user.user_id
             loan.ghl_assignee_id = main.pk  # set_officers and the response see the new assignee
         if officers is not None:
-            LoanService.set_officers(loan, officers)
+            LoanService.set_officers(loan, officers, actor=self.request.user)
         elif main is not None:
-            LoanService.add_ghl_assignee(loan)
+            LoanService.add_ghl_assignee(loan, actor=self.request.user)
         if shared:
             update_opportunity_in_ghl(serializer.instance.opportunity, triggered_by=self.request.user, **shared)

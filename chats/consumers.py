@@ -15,6 +15,7 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         {"type": "message", "chat": <id>, "message": {...}}   new message, incl. your own
         {"type": "read", "chat": <id>, "last_read_at": "..."}  you read it in another tab
         {"type": "removed", "chat": <id>}                      you were removed from a group
+        {"type": "notification", "notification": {...}, "unread_count": n}   see NotificationService.push
         {"type": "ack", "ref": ..., ...} / {"type": "error", "ref": ..., "error": "..."}
     """
 

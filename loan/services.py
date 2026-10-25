@@ -11,6 +11,8 @@ from chats.models import Message
 from chats.services import ChatService
 from ghl.models import GHLOpportunity, GHLUser
 from ghl.services import GHLAPIError, GHLService, MediaService
+from notifications.models import Notification
+from notifications.services import NotificationService, loan_officer_ids
 
 from .models import DocumentRequest, DocumentType, Loan, LoanDocument, LoanOfficer
 
@@ -48,10 +50,11 @@ class LoanService:
 
     @staticmethod
     @transaction.atomic
-    def set_officers(loan, officers):
+    def set_officers(loan, officers, actor=None):
         """Replace the loan's officers with `officers` (users), keeping existing assignments' order.
 
         The GHL assignee always stays on (see add_ghl_assignee); to remove them, reassign in GHL.
+        Officers who are new on the loan are notified.
         """
         wanted = list(dict.fromkeys(u.pk for u in officers))
         if loan.ghl_assignee_id and loan.ghl_assignee_id not in wanted:
@@ -59,19 +62,26 @@ class LoanService:
         active = loan.officer_assignments.filter(is_deleted=False)
         active.exclude(officer_id__in=wanted).update(is_deleted=True)
         existing = set(active.values_list("officer_id", flat=True))
-        LoanOfficer.objects.bulk_create(
-            [LoanOfficer(loan=loan, officer_id=pk) for pk in wanted if pk not in existing]
+        added = [pk for pk in wanted if pk not in existing]
+        LoanOfficer.objects.bulk_create([LoanOfficer(loan=loan, officer_id=pk) for pk in added])
+        NotificationService.notify(
+            added, Notification.Kind.LOAN_ASSIGNED, f"You were added to {loan}", loan=loan, actor=actor,
         )
 
     @staticmethod
-    def add_ghl_assignee(loan):
-        """Add the opportunity's GHL assigned user to the loan's officers, if they have a login.
+    def add_ghl_assignee(loan, actor=None):
+        """Add the opportunity's GHL assigned user to the loan's officers, if they have a login,
+        and notify them when they're new on the loan.
 
         Officers already on the loan are kept, including a previous GHL assignee.
         """
         assignee_id = loan.ghl_assignee_id
-        if assignee_id:
-            LoanOfficer.objects.bulk_create([LoanOfficer(loan=loan, officer_id=assignee_id)], ignore_conflicts=True)
+        if not assignee_id or loan.officer_assignments.filter(officer_id=assignee_id, is_deleted=False).exists():
+            return
+        LoanOfficer.objects.bulk_create([LoanOfficer(loan=loan, officer_id=assignee_id)], ignore_conflicts=True)
+        NotificationService.notify(
+            [assignee_id], Notification.Kind.LOAN_ASSIGNED, f"You were added to {loan}", loan=loan, actor=actor,
+        )
 
     @staticmethod
     def add_ghl_assignees():
@@ -115,7 +125,7 @@ class LoanService:
             borrower=borrower,
             created_by=created_by,
         )
-        LoanService.add_ghl_assignee(loan)
+        LoanService.add_ghl_assignee(loan, actor=created_by)
         DocumentService.request_defaults(loan, requested_by=created_by)
         return loan, borrower_created
 
@@ -224,7 +234,26 @@ class DocumentService:
             if doc_request is not None and direction == LoanDocument.Direction.BORROWER_UPLOAD:
                 doc_request.status = DocumentRequest.Status.PENDING_REVIEW
                 doc_request.save(update_fields=["status", "updated_at"])
+            # Files sent in chat already show up as unread messages.
+            if direction == LoanDocument.Direction.BORROWER_UPLOAD and origin != LoanDocument.Origin.CHAT:
+                DocumentService.notify_upload(document, user)
         return document
+
+    @staticmethod
+    def notify_upload(document, user):
+        """Tell the loan's officers a borrower file came in (for a request, a draw, or neither)."""
+        if document.draw_id:
+            target, data = f"Draw #{document.draw.number}", {"draw": document.draw_id}
+        elif document.request_id:
+            target, data = f'"{document.request.name}"', {"document_request": document.request_id}
+        else:
+            target, data = None, {}
+        NotificationService.notify(
+            loan_officer_ids(document.loan), Notification.Kind.DOCUMENT_UPLOADED,
+            f"New file{f' for {target}' if target else ''}: {document.name}",
+            f"Uploaded on {document.loan}", loan=document.loan, actor=user,
+            data={**data, "document": document.pk},
+        )
 
     @staticmethod
     def upload_template(file, user=None):
@@ -298,6 +327,14 @@ class DocumentService:
                 DocumentService.request_message(doc_request), kind=Message.Kind.DOCUMENT_REQUEST,
                 document_request=doc_request,
             )
+            # The checklist requested when a loan is created would flood the borrower; they see it
+            # in their documents and the loan chat instead.
+            if source != DocumentRequest.Source.CHECKLIST:
+                NotificationService.notify(
+                    [loan.borrower_id], Notification.Kind.DOCUMENT_REQUESTED,
+                    f"Document requested: {name}", description, loan=loan, actor=requested_by,
+                    data={"document_request": doc_request.pk},
+                )
         return doc_request
 
     @staticmethod
@@ -318,6 +355,15 @@ class DocumentService:
         document.reviewed_by = user if reviewed else None
         document.reviewed_at = timezone.now() if reviewed else None
         document.save(update_fields=["review_status", "reviewed_by", "reviewed_at"])
+        if reviewed and document.loan_id and document.visible_to_borrower:
+            accepted = review_status == LoanDocument.ReviewStatus.ACCEPTED
+            NotificationService.notify(
+                [document.loan.borrower_id], Notification.Kind.DOCUMENT_REVIEWED,
+                f'{"Accepted" if accepted else "Not accepted"}: {document.name}', note or "",
+                loan=document.loan, actor=user,
+                data={"document": document.pk, "document_request": document.request_id,
+                      "draw": document.draw_id, "review_status": review_status},
+            )
         doc_request = document.request
         if doc_request is None or not reviewed:
             if review_status == LoanDocument.ReviewStatus.REJECTED:
