@@ -1,8 +1,9 @@
 from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
-from .models import User
+from .models import PasswordLink, User
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -15,7 +16,8 @@ class UserSerializer(serializers.ModelSerializer):
 
 
 class UserWriteSerializer(serializers.ModelSerializer):
-    """Create or update a user; password is hashed and optional on update."""
+    """Create or update a user. Users are created without a password (they set one from an emailed
+    link on first sign-in); on update the password is optional and hashed."""
 
     full_name = serializers.CharField(source="get_full_name", read_only=True)
     role_label = serializers.CharField(source="get_role_display", read_only=True)
@@ -40,8 +42,6 @@ class UserWriteSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
-        if self.instance is None and not attrs.get("password"):
-            raise serializers.ValidationError({"password": "This field is required."})
         # Borrower logins are tied to their loans, so they can't be turned into staff.
         if (
             self.instance is not None
@@ -52,6 +52,7 @@ class UserWriteSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
+        validated_data.pop("password", None)
         return User.objects.create_user(**validated_data)
 
     def update(self, instance, validated_data):
@@ -75,3 +76,43 @@ class LoginSerializer(TokenObtainPairSerializer):
         data = super().validate(attrs)
         data["user"] = UserSerializer(self.user).data
         return data
+
+
+class SendPasswordLinkSerializer(serializers.Serializer):
+    """Admin sends a link; purpose is optional (set if the user has no password yet, else reset)."""
+
+    purpose = serializers.ChoiceField(choices=PasswordLink.Purpose.choices, required=False)
+
+
+class ForgotPasswordSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
+class PasswordLinkTokenSerializer(serializers.Serializer):
+    """Resolves `token` to an active PasswordLink, available as attrs["link"]."""
+
+    token = serializers.CharField()
+
+    def validate(self, attrs):
+        link = (
+            PasswordLink.active()
+            .select_related("user")
+            .filter(token_hash=PasswordLink.hash_token(attrs["token"]), user__is_active=True)
+            .first()
+        )
+        if link is None:
+            raise serializers.ValidationError({"token": "This link is invalid or has expired."})
+        attrs["link"] = link
+        return attrs
+
+
+class SetPasswordSerializer(PasswordLinkTokenSerializer):
+    password = serializers.CharField(write_only=True, style={"input_type": "password"})
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        try:
+            validate_password(attrs["password"], attrs["link"].user)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({"password": list(exc.messages)})
+        return attrs

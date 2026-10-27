@@ -187,6 +187,31 @@ GHL_SUCCESS_REDIRECT = config('GHL_SUCCESS_REDIRECT', default='')
 GHL_WEBHOOK_PUBLIC_KEY = config('GHL_WEBHOOK_PUBLIC_KEY', default='').replace('\\n', '\n')
 
 
+# Password set/reset links
+# Links point to {FRONTEND_URL}/set-password?token=...; the email is sent by a GHL inbound webhook.
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'simple': {'format': '[{asctime}] {levelname} {name}: {message}', 'style': '{'},
+    },
+    'handlers': {
+        'console': {'class': 'logging.StreamHandler', 'formatter': 'simple'},
+    },
+    'loggers': {
+        # Password link sending: what was sent, the webhook's response, and why a send was skipped
+        'accounts': {'handlers': ['console'], 'level': 'INFO'},
+    },
+}
+
+FRONTEND_URL = config('FRONTEND_URL',default='http://localhost:5173')
+PASSWORD_LINK_WEBHOOK_URL = config(
+    'PASSWORD_LINK_WEBHOOK_URL',
+    default='https://services.leadconnectorhq.com/hooks/wndRy6aE7TKvNF7YmIlG/webhook-trigger/6ldaCLtqwUd7grc2VhAm',
+)
+
+
 # Celery
 
 CELERY_BROKER_URL = config('CELERY_BROKER_URL', default='redis://localhost:6379/0')
