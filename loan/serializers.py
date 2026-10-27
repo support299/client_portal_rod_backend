@@ -5,7 +5,9 @@ from accounts.models import User
 from accounts.serializers import UserSerializer
 
 from .draw_services import DrawService
-from .models import DocumentRequest, DocumentType, DrawRequest, DrawRequestStatusChange, Loan, LoanDocument
+from .models import (
+    DocumentRequest, DocumentType, DrawRequest, DrawRequestStatusChange, Loan, LoanDocument, LoanNote,
+)
 from .services import DocumentService
 
 
@@ -461,3 +463,24 @@ class DrawStatusSerializer(serializers.Serializer):
         if user.role == User.Role.BORROWER and ({"amount_approved", "funding_reference"} & set(attrs)):
             raise serializers.ValidationError("Only staff can set the approved amount or funding reference.")
         return attrs
+
+
+class LoanNoteSerializer(serializers.ModelSerializer):
+    """An internal loan note. can_edit: the requesting user wrote it or is an admin."""
+
+    author = DocumentUserSerializer(read_only=True)
+    can_edit = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LoanNote
+        fields = ["id", "loan", "body", "is_pinned", "author", "created_at", "updated_at", "can_edit"]
+        read_only_fields = ["id", "loan", "author", "created_at", "updated_at", "can_edit"]
+
+    def validate_body(self, value):
+        if not value.strip():
+            raise serializers.ValidationError("A note can't be empty.")
+        return value
+
+    def get_can_edit(self, obj):
+        user = self.context["request"].user
+        return user.is_app_admin or obj.author_id == user.pk

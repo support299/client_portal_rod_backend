@@ -125,6 +125,28 @@ class LoanOfficer(models.Model):
         return f"{self.officer} on {self.loan}"
 
 
+class LoanNote(models.Model):
+    """An internal note on a loan, seen only by admins and the loan's officers, never the borrower."""
+
+    loan = models.ForeignKey(Loan, on_delete=models.CASCADE, related_name="notes")
+    body = models.TextField()
+    # Pinned notes are listed first.
+    is_pinned = models.BooleanField(default=False)
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="+",
+    )
+    is_deleted = models.BooleanField(default=False, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-is_pinned", "-created_at", "-id"]
+
+    def __str__(self):
+        return f"Note {self.pk} ({self.loan})"
+
+
 class DocumentType(models.Model):
     """A kind of document the office collects, e.g. "Bank Statements"; admins manage the list."""
 

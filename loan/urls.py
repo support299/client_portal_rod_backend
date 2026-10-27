@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import document_views, draw_views, views
+from . import document_views, draw_views, note_views, views
 
 app_name = "loan"
 
@@ -28,4 +28,7 @@ urlpatterns = [
     path("<int:loan_pk>/draws/summary/", draw_views.DrawSummaryView.as_view(), name="draw_summary"),
     path("<int:loan_pk>/draws/<int:pk>/", draw_views.DrawRequestDetailView.as_view(), name="draw_detail"),
     path("<int:loan_pk>/draws/<int:pk>/status/", draw_views.DrawRequestStatusView.as_view(), name="draw_status"),
+    # Internal notes
+    path("<int:loan_pk>/notes/", note_views.LoanNoteListView.as_view(), name="loan_note_list"),
+    path("<int:loan_pk>/notes/<int:pk>/", note_views.LoanNoteDetailView.as_view(), name="loan_note_detail"),
 ]
