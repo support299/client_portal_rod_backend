@@ -1,11 +1,17 @@
 from unittest import mock
 
+from django.db import connection
 from django.test import TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
+from django.utils import timezone
+from rest_framework.test import APIClient
 
 from accounts.models import User
 from ghl.models import GHLContact, GHLOpportunity, GHLUser
 from ghl.services import AccountLinkService
 
+from .models import DrawRequest, DrawRequestStatusChange, LoanDocument, LoanNote
 from .serializers import LoanSerializer
 from .services import LoanService
 from .views import visible_loans
@@ -82,3 +88,68 @@ class GHLAssigneeTests(TestCase):
         GHLOpportunity.objects.filter(pk=self.opportunity.pk).update(assigned_to="u3")
         new = User.objects.create_user(email="new@example.com", role=User.Role.CLOSER)
         self.assertTrue(self.loan.officer_assignments.filter(officer=new, is_deleted=False).exists())
+
+
+@override_settings(LOAN_PIPELINE_ID="p1")
+@mock.patch("ghl.services.CustomFieldService.names", return_value={"cf1": "Property type"})
+class LoanPageTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_user(email="admin@example.com", role=User.Role.ADMIN)
+        self.borrower_contact = GHLContact.objects.create(
+            ghl_id="c1", location_id="loc1", email="jane@example.com", company_name="Jane LLC",
+            custom_fields=[{"id": "cf1", "value": "SFH"}],
+        )
+        opportunity = GHLOpportunity.objects.create(
+            opportunity_id="opp1", location_id="loc1", contact=self.borrower_contact, pipeline_id="p1",
+        )
+        self.loan, _ = LoanService.create_from_opportunity(opportunity)
+        self.url = reverse("loan:loan_page", args=[self.loan.pk])
+        self.client = APIClient()
+
+    def add_records(self, count):
+        start = self.loan.draws.count()
+        for i in range(start, start + count):
+            draw = DrawRequest.objects.create(loan=self.loan, number=i + 1, amount_requested=100, submitted_by=self.admin)
+            DrawRequestStatusChange.objects.create(draw=draw, to_status="submitted", changed_by=self.admin)
+            LoanDocument.objects.create(
+                loan=self.loan, draw=draw, origin="app", ghl_media_id=f"m{i}", location_id="loc1",
+                url="https://example.com/f", name=f"f{i}.pdf", uploaded_by=self.admin, uploaded_at=timezone.now(),
+            )
+            LoanNote.objects.create(loan=self.loan, body=f"note {i}", author=self.admin)
+
+    def get_page(self):
+        self.client.force_authenticate(self.admin)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        return response.data
+
+    def test_returns_every_section_with_named_contact_fields(self, _names):
+        self.add_records(1)
+        data = self.get_page()
+        self.assertEqual(
+            set(data),
+            {"loan", "stages", "draws", "draw_summary", "document_requests", "documents", "document_types", "notes"},
+        )
+        contact = data["loan"]["contact_details"]
+        self.assertEqual(contact["company_name"], "Jane LLC")
+        self.assertEqual(contact["custom_fields"], [{"id": "cf1", "value": "SFH", "label": "Property type"}])
+        self.assertEqual((len(data["draws"]), len(data["documents"]), len(data["notes"])), (1, 1, 1))
+
+    def test_query_count_does_not_grow_with_records(self, _names):
+        self.add_records(1)
+        self.client.force_authenticate(self.admin)
+        with CaptureQueriesContext(connection) as few:
+            self.client.get(self.url)
+        self.add_records(4)
+        with CaptureQueriesContext(connection) as many:
+            self.client.get(self.url)
+        self.assertEqual(len(few.captured_queries), len(many.captured_queries))
+
+    def test_borrowers_are_refused(self, _names):
+        self.client.force_authenticate(self.loan.borrower)
+        self.assertEqual(self.client.get(self.url).status_code, 403)
+
+    def test_staff_not_on_the_loan_get_404(self, _names):
+        other = User.objects.create_user(email="other@example.com", role=User.Role.PROCESSOR)
+        self.client.force_authenticate(other)
+        self.assertEqual(self.client.get(self.url).status_code, 404)

@@ -15,7 +15,7 @@ from ghl.services import GHLAPIError
 from ghl.views import visible_opportunities
 
 from .models import Loan
-from .serializers import BorrowerLoanSerializer, LoanSerializer, LoanUpdateSerializer
+from .serializers import BorrowerLoanSerializer, LoanDetailSerializer, LoanSerializer, LoanUpdateSerializer
 from .services import LoanConversionError, LoanService
 
 
@@ -37,9 +37,17 @@ def visible_loans(user):
     return qs.filter(officer_assignments__officer=user, officer_assignments__is_deleted=False)
 
 
-def loan_read_serializer(user):
-    """Borrowers get a trimmed loan without internal CRM fields."""
-    return BorrowerLoanSerializer if user.role == user.Role.BORROWER else LoanSerializer
+def loan_read_serializer(user, detail=False):
+    """Borrowers get a trimmed loan without internal CRM fields; staff viewing one loan get its full detail."""
+    if user.role == user.Role.BORROWER:
+        return BorrowerLoanSerializer
+    return LoanDetailSerializer if detail else LoanSerializer
+
+
+def loan_stages():
+    """The loan pipeline's stages in order."""
+    stages = GHLPipelineStage.objects.filter(pipeline_id=settings.LOAN_PIPELINE_ID).order_by("position")
+    return [{"id": s.stage_id, "name": s.name.strip(), "position": s.position} for s in stages]
 
 
 class LoanPagination(PageNumberPagination):
@@ -88,8 +96,7 @@ class LoanStagesView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        stages = GHLPipelineStage.objects.filter(pipeline_id=settings.LOAN_PIPELINE_ID).order_by("position")
-        return Response([{"id": s.stage_id, "name": s.name.strip(), "position": s.position} for s in stages])
+        return Response(loan_stages())
 
 
 class LoanListView(ListAPIView):
@@ -141,7 +148,7 @@ class LoanDetailView(RetrieveUpdateAPIView):
     def get_serializer_class(self):
         if self.request.method in ("PUT", "PATCH"):
             return LoanUpdateSerializer
-        return loan_read_serializer(self.request.user)
+        return loan_read_serializer(self.request.user, detail=True)
 
     def update(self, request, *args, **kwargs):
         try:

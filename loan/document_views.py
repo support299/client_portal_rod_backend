@@ -72,6 +72,12 @@ def loan_documents(loan, user):
     return qs.filter(visible_to_borrower=True) if is_borrower(user) else qs
 
 
+def document_types(user):
+    """Active document types; admins also see inactive ones."""
+    qs = DocumentType.objects.all()
+    return qs if user.is_app_admin else qs.filter(is_active=True)
+
+
 def document_requests(loan, user):
     files = LoanDocument.objects.filter(is_deleted=False).select_related("uploaded_by", "reviewed_by", "document_type")
     if is_borrower(user):
@@ -117,10 +123,7 @@ class DocumentTypeSaveMixin:
         return [IsAppAdmin()]
 
     def get_queryset(self):
-        qs = DocumentType.objects.all()
-        if not self.request.user.is_app_admin:
-            qs = qs.filter(is_active=True)
-        return qs
+        return document_types(self.request.user)
 
     def save_type(self, serializer):
         template = serializer.validated_data.pop("template_file", None)

@@ -3,6 +3,8 @@ from rest_framework import serializers
 
 from accounts.models import User
 from accounts.serializers import UserSerializer
+from ghl.models import GHLContact
+from ghl.services import CustomFieldService
 
 from .draw_services import DrawService
 from .models import (
@@ -54,6 +56,58 @@ class LoanSerializer(serializers.ModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = fields
+
+
+class LoanContactSerializer(serializers.ModelSerializer):
+    """The GHL contact on a loan's opportunity, for the staff loan page."""
+
+    website = serializers.CharField(source="raw.website", read_only=True, default="")
+    timezone = serializers.CharField(source="raw.timezone", read_only=True, default="")
+
+    class Meta:
+        model = GHLContact
+        fields = [
+            "ghl_id", "contact_name", "first_name", "last_name", "email", "phone", "company_name",
+            "website", "type", "source", "tags", "address1", "city", "state", "postal_code", "country",
+            "timezone", "dnd", "date_added", "date_updated",
+        ]
+        read_only_fields = fields
+
+
+class LoanDetailSerializer(LoanSerializer):
+    """One loan for the staff loan page: LoanSerializer plus the GHL contact, more opportunity
+    dates and named custom fields. Forecast/probability fields are left out on purpose.
+    """
+
+    custom_fields = serializers.SerializerMethodField()
+    contact_details = serializers.SerializerMethodField()
+    original_close_date = serializers.DateField(source="opportunity.original_close_date", read_only=True)
+    last_stage_change_at = serializers.DateTimeField(source="opportunity.last_stage_change_at", read_only=True)
+    last_status_change_at = serializers.DateTimeField(source="opportunity.last_status_change_at", read_only=True)
+    opportunity_created_at = serializers.DateTimeField(source="opportunity.date_added", read_only=True)
+    opportunity_updated_at = serializers.DateTimeField(source="opportunity.date_updated", read_only=True)
+    synced_at = serializers.DateTimeField(source="opportunity.synced_at", read_only=True)
+
+    class Meta(LoanSerializer.Meta):
+        fields = LoanSerializer.Meta.fields + [
+            "contact_details", "original_close_date", "last_stage_change_at", "last_status_change_at",
+            "opportunity_created_at", "opportunity_updated_at", "synced_at",
+        ]
+        read_only_fields = fields
+
+    def _field_names(self, obj):
+        return CustomFieldService.names(obj.opportunity.location_id)
+
+    def get_custom_fields(self, obj):
+        return CustomFieldService.labelled(obj.opportunity.custom_fields, self._field_names(obj))
+
+    def get_contact_details(self, obj):
+        contact = obj.opportunity.contact
+        if contact is None:
+            return None
+        data = LoanContactSerializer(contact).data
+        data["custom_fields"] = CustomFieldService.labelled(contact.custom_fields, self._field_names(obj))
+        return data
 
 
 class LoanOfficerContactSerializer(serializers.ModelSerializer):
@@ -160,7 +214,8 @@ class LoanUpdateSerializer(serializers.ModelSerializer):
         return attrs
 
     def to_representation(self, instance):
-        return LoanSerializer(instance, context=self.context).data
+        # The loan page replaces its loan with this response, so send the full detail
+        return LoanDetailSerializer(instance, context=self.context).data
 
 
 def validate_upload(file):

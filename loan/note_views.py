@@ -7,6 +7,10 @@ from .document_views import LoanScopedMixin
 from .serializers import LoanNoteSerializer
 
 
+def loan_notes(loan):
+    return loan.notes.filter(is_deleted=False).select_related("author")
+
+
 class LoanNoteMixin(LoanScopedMixin):
     """Notes are internal: staff only, so admins and the loan's officers (see visible_loans)."""
 
@@ -14,7 +18,7 @@ class LoanNoteMixin(LoanScopedMixin):
     serializer_class = LoanNoteSerializer
 
     def get_queryset(self):
-        return self.loan.notes.filter(is_deleted=False).select_related("author")
+        return loan_notes(self.loan)
 
 
 class LoanNoteListView(LoanNoteMixin, ListCreateAPIView):

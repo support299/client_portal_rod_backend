@@ -4,6 +4,7 @@ import time
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.db import transaction
 from django.db.models import Exists, OuterRef, Subquery
 from django.utils import timezone
@@ -318,6 +319,48 @@ class PipelineService:
             GHLPipelineStage.objects.filter(stage_id__in=stage_to_pipeline)
             .values_list("stage_id", flat=True)
         )
+
+
+class CustomFieldService:
+    """Names for custom fields: GHL records only carry each field's id."""
+
+    CACHE_SECONDS = 60 * 60
+    # After a failure (e.g. the token lacks the customFields scope), wait before asking GHL again
+    FAILURE_CACHE_SECONDS = 10 * 60
+    # Callers are page loads, so don't wait long on GHL
+    TIMEOUT_SECONDS = 5
+
+    @staticmethod
+    def names(location_id):
+        """{field id: name} for the location's contact and opportunity custom fields, cached.
+
+        Returns {} if GHL can't be asked; callers then fall back to showing the ids.
+        """
+        if not location_id:
+            return {}
+        key = f"ghl:custom-field-names:{location_id}"
+        names = cache.get(key)
+        if names is not None:
+            return names
+        try:
+            token = GHLService.token_for_location(location_id)
+            data = GHLService.json(api_request(
+                token, "GET", f"/locations/{location_id}/customFields",
+                params={"model": "all"}, timeout=CustomFieldService.TIMEOUT_SECONDS,
+            ))
+        except Exception:
+            # Labels are a nicety: never fail the caller over them
+            logger.warning("Could not fetch GHL custom fields for location %s", location_id, exc_info=True)
+            cache.set(key, {}, CustomFieldService.FAILURE_CACHE_SECONDS)
+            return {}
+        names = {f["id"]: f.get("name") or f["id"] for f in data.get("customFields") or [] if f.get("id")}
+        cache.set(key, names, CustomFieldService.CACHE_SECONDS)
+        return names
+
+    @staticmethod
+    def labelled(fields, names):
+        """A record's custom fields, each with a `label` added (None when the name is unknown)."""
+        return [{**f, "label": names.get(f.get("id"))} for f in fields or [] if isinstance(f, dict)]
 
 
 class ContactService:
