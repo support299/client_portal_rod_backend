@@ -3,6 +3,7 @@ from datetime import timedelta
 
 from celery import shared_task
 from loan.services import LoanService
+from loan.tasks import import_all_survey_documents
 
 from .client import GHLAuthError, get_access_token
 from .models import GHLToken
@@ -45,8 +46,9 @@ def sync_ghl_location(self, location_id):
 
     Afterwards every loan-pipeline assignee without a login gets one (see
     AccountLinkService.create_assignee_accounts), every loan-pipeline opportunity without a loan
-    gets one (see LoanService.ensure_pipeline_loans), and every loan gets its GHL assignee among
-    its officers (see LoanService.add_ghl_assignees).
+    gets one (see LoanService.ensure_pipeline_loans), every loan gets its GHL assignee among
+    its officers (see LoanService.add_ghl_assignees), and the location's loans get the files
+    uploaded for them in the survey app (see SurveyService.import_documents).
     """
     try:
         users = UserService.sync(location_id)
@@ -59,6 +61,8 @@ def sync_ghl_location(self, location_id):
     loans, skipped = LoanService.ensure_pipeline_loans()
     # Picks up GHL reassignments, and GHL users who only now got linked to a login.
     LoanService.add_ghl_assignees()
+    # One task per loan, so a slow or failing survey app doesn't hold up or undo the sync.
+    import_all_survey_documents.delay(location_id)
     # Find (or create) the documents folder now, so the first upload doesn't have to. A failure
     # here (e.g. the app lacks the media scopes) mustn't undo the sync; uploads try again.
     try:

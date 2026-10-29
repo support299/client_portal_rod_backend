@@ -1,11 +1,14 @@
 import logging
+import mimetypes
 import os
 
+import requests
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.db.models import Exists, OuterRef, Subquery
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from chats.models import Message
 from chats.services import ChatService
@@ -127,6 +130,10 @@ class LoanService:
         )
         LoanService.add_ghl_assignee(loan, actor=created_by)
         DocumentService.request_defaults(loan, requested_by=created_by)
+        # Imported from loan.tasks here, since loan.tasks imports this module.
+        from .tasks import import_survey_documents
+        # After commit, so the task finds the loan and a slow survey app never holds the transaction.
+        transaction.on_commit(lambda: import_survey_documents.delay(loan.pk))
         return loan, borrower_created
 
     @staticmethod
@@ -173,6 +180,100 @@ class LoanService:
             if loan:
                 created.append(loan)
         return created, skipped
+
+
+class SurveyAPIError(Exception):
+    pass
+
+
+class SurveyService:
+    """Files borrowers uploaded in the survey app (settings.SURVEY_API_BASE_URL) for an opportunity.
+
+    The files are already in GHL media, so only their metadata is stored, as the loan's
+    LoanDocuments keyed by ghl_media_id: importing again updates them instead of adding copies.
+    """
+
+    REVIEW_STATUSES = {
+        "accepted": LoanDocument.ReviewStatus.ACCEPTED,
+        "rejected": LoanDocument.ReviewStatus.REJECTED,
+    }
+
+    @staticmethod
+    def fetch(opportunity_id):
+        """The survey app's data for an opportunity, or None if it has none."""
+        if not settings.EXTERNAL_API_SECRET_KEY:
+            raise SurveyAPIError("EXTERNAL_API_SECRET_KEY is not set.")
+        url = f"{settings.SURVEY_API_BASE_URL.rstrip('/')}/opportunities/{opportunity_id}/"
+        try:
+            resp = requests.get(
+                url, headers={"X-API-Key": settings.EXTERNAL_API_SECRET_KEY, "Accept": "application/json"},
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            raise SurveyAPIError(f"Survey request for {opportunity_id} failed: {exc}") from exc
+        if resp.status_code == 404:
+            return None
+        if not resp.ok:
+            raise SurveyAPIError(f"Survey returned {resp.status_code} for {opportunity_id}: {resp.text[:500]}")
+        return resp.json()
+
+    @staticmethod
+    def import_documents(loan):
+        """Store the files uploaded in the survey app for the loan's opportunity. Returns how many were saved."""
+        data = SurveyService.fetch(loan.opportunity_id) or {}
+        doc_request = data.get("document_request") or {}
+        location_id = (doc_request.get("ghl_account") or {}).get("location_id") or loan.opportunity.location_id
+        saved = 0
+        for requested in doc_request.get("requested_documents") or []:
+            for upload in requested.get("uploads") or []:
+                if SurveyService.save_upload(loan, upload, location_id, requested.get("document") or {}):
+                    saved += 1
+        return saved
+
+    @staticmethod
+    def save_upload(loan, upload, location_id, requested_document):
+        """Create or update the LoanDocument for one survey upload; False if it has no GHL file.
+
+        A file already stored from elsewhere (app, chat, GHL) is only linked to the loan if it has none.
+        """
+        media_id, url = upload.get("ghl_file_id"), upload.get("file_url")
+        if not media_id or not url:
+            logger.info("Survey upload %s on loan %s has no GHL file; skipped", upload.get("id"), loan.pk)
+            return False
+        name = (upload.get("file_name") or os.path.basename(url))[:255]
+        reviewed_at = upload.get("accepted_at") or upload.get("rejected_at")
+        fields = {
+            "loan": loan,
+            "location_id": location_id,
+            "url": url,
+            "name": name,
+            "content_type": mimetypes.guess_type(name)[0] or "",
+            "review_status": SurveyService.REVIEW_STATUSES.get(
+                upload.get("status"), LoanDocument.ReviewStatus.UNREVIEWED,
+            ),
+            "reviewed_at": parse_datetime(reviewed_at) if reviewed_at else None,
+            "uploaded_at": parse_datetime(upload.get("uploaded_at") or "") or timezone.now(),
+            # The requested document it was uploaded for, e.g. "AML CRBO".
+            "raw": {**upload, "requested_document": requested_document},
+        }
+        existing = LoanDocument.objects.filter(ghl_media_id=media_id).first()
+        if existing is None:
+            try:
+                LoanDocument.objects.create(
+                    ghl_media_id=media_id, direction=LoanDocument.Direction.BORROWER_UPLOAD,
+                    origin=LoanDocument.Origin.SURVEY, **fields,
+                )
+            except IntegrityError:
+                # Saved concurrently by another import of the same loan.
+                pass
+        elif existing.origin == LoanDocument.Origin.SURVEY:
+            for field, value in fields.items():
+                setattr(existing, field, value)
+            existing.save()
+        elif existing.loan_id is None:
+            existing.loan = loan
+            existing.save(update_fields=["loan", "synced_at"])
+        return True
 
 
 class DocumentError(Exception):

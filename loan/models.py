@@ -336,6 +336,7 @@ class LoanDocument(models.Model):
         APP = "app", "Uploaded in app"
         CHAT = "chat", "Sent in chat"
         GHL = "ghl", "Imported from GHL"
+        SURVEY = "survey", "Imported from survey"
 
     class ReviewStatus(models.TextChoices):
         UNREVIEWED = "unreviewed", "Unreviewed"

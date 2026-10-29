@@ -227,3 +227,7 @@ CELERY_BEAT_SCHEDULE = {
 # The one GHL pipeline this app handles ("02 Processing Pipeline"). A loan's status is its
 # opportunity's stage in this pipeline.
 LOAN_PIPELINE_ID = config('LOAN_PIPELINE_ID', default='mSfFTRYaWxMJ4JShKpBx')
+
+# The survey app, where borrowers upload files for an opportunity; they're imported as loan documents.
+SURVEY_API_BASE_URL = config('SURVEY_API_BASE_URL', default='https://survey.flipfunding.com/api/external')
+EXTERNAL_API_SECRET_KEY = config('EXTERNAL_API_SECRET_KEY', default='')
