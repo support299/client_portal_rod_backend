@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import document_views, draw_views, note_views, page_views, views
+from . import document_views, draw_views, note_views, page_views, task_views, views
 
 app_name = "loan"
 
@@ -8,6 +8,7 @@ urlpatterns = [
     path("", views.LoanListView.as_view(), name="loan_list"),
     path("from-opportunity/", views.LoanFromOpportunityView.as_view(), name="loan_from_opportunity"),
     path("stages/", views.LoanStagesView.as_view(), name="loan_stages"),
+    path("tasks/", task_views.TaskListView.as_view(), name="task_list"),
     path("<int:pk>/", views.LoanDetailView.as_view(), name="loan_detail"),
     path("<int:pk>/page/", page_views.LoanPageView.as_view(), name="loan_page"),
     # Documents
