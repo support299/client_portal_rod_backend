@@ -138,6 +138,16 @@ class BorrowerLoanSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class BrokerLoanSerializer(BorrowerLoanSerializer):
+    """What a broker sees of a client's loan: the borrower view plus who the client is."""
+
+    borrower = UserSerializer(read_only=True)
+
+    class Meta(BorrowerLoanSerializer.Meta):
+        fields = BorrowerLoanSerializer.Meta.fields + ["borrower"]
+        read_only_fields = fields
+
+
 class LoanUpdateSerializer(serializers.ModelSerializer):
     """Editable loan fields. The officers may only be changed by admins (enforced in validate).
 
@@ -321,7 +331,7 @@ class LoanDocumentUploadSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         user = self.context["request"].user
-        if user.role == User.Role.BORROWER:
+        if user.is_portal_user:
             attrs["direction"] = LoanDocument.Direction.BORROWER_UPLOAD
             attrs["visible_to_borrower"] = True
         elif "direction" not in attrs:
@@ -489,7 +499,7 @@ class DrawRequestUpdateSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         user = self.context["request"].user
-        if user.role == User.Role.BORROWER:
+        if user.is_portal_user:
             if set(attrs) - self.BORROWER_FIELDS:
                 raise serializers.ValidationError("You can only change the amount and your comment.")
             if self.instance.status not in DrawService.BORROWER_EDITABLE:
@@ -515,7 +525,7 @@ class DrawStatusSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         user = self.context["request"].user
-        if user.role == User.Role.BORROWER and ({"amount_approved", "funding_reference"} & set(attrs)):
+        if user.is_portal_user and ({"amount_approved", "funding_reference"} & set(attrs)):
             raise serializers.ValidationError("Only staff can set the approved amount or funding reference.")
         return attrs
 

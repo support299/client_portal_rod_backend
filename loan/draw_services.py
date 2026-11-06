@@ -43,7 +43,7 @@ class DrawService:
 
     @staticmethod
     def allowed_transitions(draw, user):
-        transitions = DrawService.BORROWER_TRANSITIONS if user.role == user.Role.BORROWER \
+        transitions = DrawService.BORROWER_TRANSITIONS if user.is_portal_user \
             else DrawService.STAFF_TRANSITIONS
         return transitions.get(draw.status, [])
 

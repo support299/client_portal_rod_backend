@@ -15,12 +15,15 @@ from ghl.services import GHLAPIError
 from ghl.views import visible_opportunities
 
 from .models import Loan
-from .serializers import BorrowerLoanSerializer, LoanDetailSerializer, LoanSerializer, LoanUpdateSerializer
+from .serializers import (
+    BorrowerLoanSerializer, BrokerLoanSerializer, LoanDetailSerializer, LoanSerializer, LoanUpdateSerializer,
+)
 from .services import LoanConversionError, LoanService
 
 
 def visible_loans(user):
-    """Admins see every loan, borrowers their own loans, other staff the loans assigned to them."""
+    """Admins see every loan, borrowers their own loans, brokers their clients' loans,
+    other staff the loans assigned to them."""
     ghl_assignee = GHLUser.objects.filter(
         user_id=OuterRef("opportunity__assigned_to"), account__isnull=False,
     ).values("account")[:1]
@@ -34,11 +37,16 @@ def visible_loans(user):
         return qs
     if user.role == user.Role.BORROWER:
         return qs.filter(borrower=user)
+    if user.role == user.Role.BROKER:
+        return qs.filter(borrower__broker=user)
     return qs.filter(officer_assignments__officer=user, officer_assignments__is_deleted=False)
 
 
 def loan_read_serializer(user, detail=False):
-    """Borrowers get a trimmed loan without internal CRM fields; staff viewing one loan get its full detail."""
+    """Portal users get a trimmed loan without internal CRM fields (brokers also see who the
+    client is); staff viewing one loan get its full detail."""
+    if user.role == user.Role.BROKER:
+        return BrokerLoanSerializer
     if user.role == user.Role.BORROWER:
         return BorrowerLoanSerializer
     return LoanDetailSerializer if detail else LoanSerializer

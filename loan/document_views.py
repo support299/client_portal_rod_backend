@@ -42,10 +42,6 @@ def ghl_failed(exc):
     return Response({"error": f"Could not store the file in GHL: {exc}"}, status=status.HTTP_502_BAD_GATEWAY)
 
 
-def is_borrower(user):
-    return user.role == user.Role.BORROWER
-
-
 def stream_file(document, as_attachment=True):
     """Proxy a file from GHL media, so its public url never reaches the client."""
     try:
@@ -67,9 +63,9 @@ def stream_file(document, as_attachment=True):
 
 
 def loan_documents(loan, user):
-    """The loan's files; borrowers don't see internal ones."""
+    """The loan's files; portal users (borrowers and brokers) don't see internal ones."""
     qs = loan.documents.filter(is_deleted=False).select_related("uploaded_by", "reviewed_by", "document_type")
-    return qs.filter(visible_to_borrower=True) if is_borrower(user) else qs
+    return qs.filter(visible_to_borrower=True) if user.is_portal_user else qs
 
 
 def document_types(user):
@@ -80,7 +76,7 @@ def document_types(user):
 
 def document_requests(loan, user):
     files = LoanDocument.objects.filter(is_deleted=False).select_related("uploaded_by", "reviewed_by", "document_type")
-    if is_borrower(user):
+    if user.is_portal_user:
         files = files.filter(visible_to_borrower=True)
     return (
         loan.document_requests.filter(is_deleted=False)
@@ -334,7 +330,7 @@ class LoanDocumentDetailView(LoanScopedMixin, RetrieveUpdateDestroyAPIView):
 
     def perform_destroy(self, instance):
         user = self.request.user
-        if is_borrower(user) and (
+        if user.is_portal_user and (
             instance.uploaded_by_id != user.pk
             or instance.review_status != LoanDocument.ReviewStatus.UNREVIEWED
         ):
@@ -353,7 +349,7 @@ class LoanDocumentDownloadView(LoanScopedMixin, APIView):
     def get(self, request, loan_pk, pk):
         forms = self.loan.document_requests.filter(is_deleted=False).values("form_document")
         documents = LoanDocument.objects.filter(is_deleted=False).filter(Q(loan=self.loan) | Q(pk__in=forms))
-        if is_borrower(request.user):
+        if request.user.is_portal_user:
             documents = documents.filter(visible_to_borrower=True)
         document = get_object_or_404(documents, pk=pk)
         return stream_file(document, as_attachment=request.query_params.get("inline") != "true")

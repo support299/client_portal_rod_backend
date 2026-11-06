@@ -8,7 +8,7 @@ from rest_framework.views import APIView
 
 from accounts.views import IsAppAdmin
 
-from .document_views import LoanScopedMixin, is_borrower
+from .document_views import LoanScopedMixin
 from .draw_services import DrawError, DrawService
 from .models import DrawRequestStatusChange, LoanDocument
 from .serializers import (
@@ -17,9 +17,9 @@ from .serializers import (
 
 
 def loan_draws(loan, user):
-    """The loan's draws, each with its files and history; borrowers don't see internal files."""
+    """The loan's draws, each with its files and history; portal users don't see internal files."""
     files = LoanDocument.objects.filter(is_deleted=False).select_related("uploaded_by", "reviewed_by", "document_type")
-    if is_borrower(user):
+    if user.is_portal_user:
         files = files.filter(visible_to_borrower=True)
     changes = DrawRequestStatusChange.objects.select_related("changed_by")
     return (

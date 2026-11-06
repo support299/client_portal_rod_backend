@@ -13,8 +13,13 @@ logger = logging.getLogger(__name__)
 
 
 def loan_officer_ids(loan):
-    """The loan's active officers. Admins who aren't on the loan aren't notified."""
-    return set(loan.officer_assignments.filter(is_deleted=False).values_list("officer_id", flat=True))
+    """The loan's active officers plus the borrower's broker, if any.
+
+    Admins who aren't on the loan aren't notified."""
+    ids = set(loan.officer_assignments.filter(is_deleted=False).values_list("officer_id", flat=True))
+    if loan.borrower.broker_id:
+        ids.add(loan.borrower.broker_id)
+    return ids
 
 
 def loan_team_ids(loan):

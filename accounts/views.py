@@ -37,11 +37,11 @@ class IsAppAdmin(BasePermission):
 
 
 class IsStaffMember(BasePermission):
-    """Allow every role except borrowers."""
+    """Allow internal team members: every role except borrowers and brokers (who use the client portal)."""
 
     def has_permission(self, request, view):
         user = request.user
-        return bool(user and user.is_authenticated and user.role != User.Role.BORROWER)
+        return bool(user and user.is_authenticated and not user.is_portal_user)
 
 
 class LoginView(TokenObtainPairView):
@@ -65,8 +65,9 @@ class UserCreateView(ListCreateAPIView):
     """List users (GET) or create one (POST).
 
     GET query params (all optional): search (partial, case-insensitive match on
-    name, email or phone), role, staff (true: every role except borrower,
-    false: borrowers only), is_active (true/false), page, page_size.
+    name, email or phone), role, broker (a broker's user id: that broker's clients),
+    staff (true: every role except borrower, false: borrowers only),
+    is_active (true/false), page, page_size.
     POST body: email, first_name, last_name, phone, role, is_active. No password: the user
     sets one from the link emailed on their first sign-in.
     """
@@ -77,7 +78,7 @@ class UserCreateView(ListCreateAPIView):
 
     def get_queryset(self):
         params = self.request.query_params
-        qs = User.objects.select_related("ghl_user").annotate(loan_count=Count("loans"))
+        qs = User.objects.select_related("ghl_user", "broker").annotate(loan_count=Count("loans"))
 
         staff = params.get("staff", "").lower()
         if staff == "true":
@@ -88,6 +89,10 @@ class UserCreateView(ListCreateAPIView):
         role = params.get("role")
         if role:
             qs = qs.filter(role=role)
+
+        broker = params.get("broker")
+        if broker:
+            qs = qs.filter(broker=broker)
 
         is_active = params.get("is_active", "").lower()
         if is_active in ("true", "false"):
@@ -104,7 +109,8 @@ class UserCreateView(ListCreateAPIView):
 
 
 class UserUpdateView(UpdateAPIView):
-    """Update a user (PATCH for partial, PUT for full). password is optional."""
+    """Update a user (PATCH for partial, PUT for full). Passwords aren't set here; use
+    UserPasswordLinkView to email the user a set/reset link."""
 
     queryset = User.objects.all()
     serializer_class = UserWriteSerializer

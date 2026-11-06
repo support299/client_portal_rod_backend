@@ -46,6 +46,7 @@ class User(AbstractUser):
         CLOSER = "closer", "Closer"
         DRAW_SPECIALIST = "draw_specialist", "Draw Specialist"
         ACCOUNTING = "accounting", "Accounting"
+        BROKER = "broker", "Broker"
         ADMIN = "admin", "Admin"
 
     username = None
@@ -63,6 +64,17 @@ class User(AbstractUser):
         max_length=30,
         choices=Role.choices,
         default=Role.BORROWER,
+    )
+
+    # The broker managing this borrower's account. Only set on borrowers; brokers see
+    # their clients' loans through it (see loan.views.visible_loans).
+    broker = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="clients",
+        limit_choices_to={"role": Role.BROKER},
     )
 
     created_at = models.DateTimeField(
@@ -85,6 +97,12 @@ class User(AbstractUser):
     def is_app_admin(self):
         """Admins (admin role or Django staff) see everything; other roles see only their own data."""
         return self.is_staff or self.role == self.Role.ADMIN
+
+    @property
+    def is_portal_user(self):
+        """Borrowers and brokers use the client portal and get the borrower-shaped view of a loan:
+        no internal files, notes or CRM fields, and borrower-level permissions."""
+        return self.role in (self.Role.BORROWER, self.Role.BROKER)
 
 
 class PasswordLink(models.Model):

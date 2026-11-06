@@ -33,15 +33,18 @@ def admin_ids():
 
 
 def visible_chats(user):
-    """Admins see every chat; borrowers their loans' chats; other staff the chats of loans they're
-    on plus the groups and direct messages they're a member of."""
+    """Admins see every chat; borrowers their loans' chats; brokers their clients' loans' chats;
+    other staff the chats of loans they're on. Non-borrowers also see the groups and direct
+    messages they're a member of."""
     qs = Chat.objects.filter(is_deleted=False).exclude(kind=Chat.Kind.LOAN, loan__is_deleted=True)
     if user.is_app_admin:
         return qs
     if user.role == user.Role.BORROWER:
         return qs.filter(kind=Chat.Kind.LOAN, loan__borrower=user)
-    on_loan = LoanOfficer.objects.filter(loan=OuterRef("loan"), officer=user, is_deleted=False)
     member = ChatMember.objects.filter(chat=OuterRef("pk"), user=user, is_deleted=False)
+    if user.role == user.Role.BROKER:
+        return qs.filter(Q(kind=Chat.Kind.LOAN, loan__borrower__broker=user) | Exists(member))
+    on_loan = LoanOfficer.objects.filter(loan=OuterRef("loan"), officer=user, is_deleted=False)
     return qs.filter((Q(kind=Chat.Kind.LOAN) & Exists(on_loan)) | Exists(member))
 
 
@@ -136,6 +139,8 @@ class ChatService:
         loans = Loan.objects.filter(is_deleted=False, chat__isnull=True)
         if user.role == user.Role.BORROWER:
             loans = loans.filter(borrower=user)
+        elif user.role == user.Role.BROKER:
+            loans = loans.filter(borrower__broker=user)
         elif not user.is_app_admin:
             loans = loans.filter(officer_assignments__officer=user, officer_assignments__is_deleted=False)
         Chat.objects.bulk_create(
