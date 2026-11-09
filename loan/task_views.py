@@ -1,14 +1,16 @@
 from datetime import timedelta
 
-from django.db.models import Prefetch
+from django.db.models import Prefetch, Q
 from django.utils import timezone
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.generics import CreateAPIView, RetrieveUpdateDestroyAPIView
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.views import IsStaffMember
 
-from .models import DocumentRequest, DrawRequest, LoanDocument
-from .serializers import LoanDocumentSerializer
+from .models import DocumentRequest, DrawRequest, LoanDocument, StaffTask
+from .serializers import LoanDocumentSerializer, StaffTaskSerializer
 from .views import visible_loans
 
 # How far back the "Done" list reaches.
@@ -23,12 +25,15 @@ DRAW_ACTIONS = {
 }
 
 
+def user_name(user):
+    return (user.get_full_name().strip() or user.email) if user else ""
+
+
 def loan_summary(loan):
-    borrower = loan.borrower
     return {
         "id": loan.pk,
         "name": str(loan),
-        "borrower": (borrower.get_full_name().strip() or borrower.email) if borrower else "",
+        "borrower": user_name(loan.borrower),
     }
 
 
@@ -49,16 +54,21 @@ class TaskListView(APIView):
     - file_review: a borrower uploaded a file without a request
     - draw_review: a draw waits on staff (submitted, inspected or approved)
 
-    Query params: scope=mine (default; loans you're an officer on) or all (admins: every loan).
-    Returns {"open": [...], "done": [...]}, newest first; done is reviews from the last DONE_DAYS days.
+    Manual tasks (StaffTask, type "manual") ride along: open ones in open, completed ones in done.
+    They open and close by hand instead (see StaffTaskCreateView / StaffTaskDetailView).
+
+    Query params: scope=mine (default; loans you're an officer on, manual tasks assigned to you)
+    or all (admins: every loan and everyone's tasks).
+    Returns {"open": [...], "done": [...]}, newest first; done is from the last DONE_DAYS days.
     """
 
     permission_classes = [IsStaffMember]
 
     def get(self, request):
         user = request.user
+        all_scope = user.is_app_admin and request.query_params.get("scope") == "all"
         loans = visible_loans(user)
-        if not (user.is_app_admin and request.query_params.get("scope") == "all"):
+        if not all_scope:
             loans = loans.filter(officer_assignments__officer=user, officer_assignments__is_deleted=False)
         loans = {loan.pk: loan for loan in loans.distinct()}
         loan_ids = list(loans)
@@ -108,6 +118,27 @@ class TaskListView(APIView):
                 "amount": draw.amount_approved if draw.amount_approved is not None else draw.amount_requested,
             })
 
+        # Manual tasks follow their assignee, not the loan's officers: one you're given shows up
+        # even on a loan you're not on.
+        manual = StaffTask.objects.filter(is_deleted=False).select_related(
+            "loan__opportunity", "loan__borrower", "assigned_to", "created_by", "completed_by",
+        )
+        if not all_scope:
+            manual = manual.filter(assigned_to=user)
+        for task in manual.filter(completed_at__isnull=True):
+            open_tasks.append({
+                "id": f"manual-{task.pk}",
+                "type": "manual",
+                "title": task.title,
+                "note": task.note,
+                "loan": loan_summary(task.loan) if task.loan_id else None,
+                "at": task.created_at,
+                "task": task.pk,
+                "due_date": task.due_date,
+                "assigned_to": {"id": task.assigned_to_id, "full_name": user_name(task.assigned_to)},
+                "created_by": user_name(task.created_by),
+            })
+
         since = timezone.now() - timedelta(days=DONE_DAYS)
         done = []
         reviewed = LoanDocument.objects.filter(
@@ -115,7 +146,6 @@ class TaskListView(APIView):
             draw__isnull=True, reviewed_at__gte=since,
         ).exclude(review_status=LoanDocument.ReviewStatus.UNREVIEWED).select_related("request", "reviewed_by")
         for document in reviewed.order_by("-reviewed_at")[:DONE_LIMIT]:
-            reviewer = document.reviewed_by
             accepted = document.review_status == LoanDocument.ReviewStatus.ACCEPTED
             done.append({
                 "id": f"file-{document.pk}",
@@ -125,10 +155,71 @@ class TaskListView(APIView):
                 "outcome": document.review_status,
                 "loan": loan_summary(loans[document.loan_id]),
                 "at": document.reviewed_at,
-                "by": (reviewer.get_full_name().strip() or reviewer.email) if reviewer else "",
+                "by": user_name(document.reviewed_by),
+            })
+
+        for task in manual.filter(completed_at__gte=since):
+            done.append({
+                "id": f"manual-{task.pk}",
+                "type": "manual",
+                "title": f"Completed: {task.title}",
+                "outcome": "completed",
+                "loan": loan_summary(task.loan) if task.loan_id else None,
+                "at": task.completed_at,
+                "by": user_name(task.completed_by),
             })
 
         open_tasks.sort(key=lambda t: t["at"], reverse=True)
+        done.sort(key=lambda t: t["at"], reverse=True)
+        done = done[:DONE_LIMIT]
         for task in open_tasks + done:
             task["at"] = task["at"].isoformat()
         return Response({"open": open_tasks, "done": done})
+
+
+class StaffTaskCreateView(CreateAPIView):
+    """POST a manual task for yourself or a teammate.
+
+    Body: title, assigned_to_id, and optionally note, loan, due_date.
+    A loan-linked task must be on a loan you can see.
+    """
+
+    permission_classes = [IsStaffMember]
+    serializer_class = StaffTaskSerializer
+
+    def perform_create(self, serializer):
+        loan = serializer.validated_data.get("loan")
+        if loan and not visible_loans(self.request.user).filter(pk=loan.pk).exists():
+            raise PermissionDenied("You can't add a task to a loan you don't have access to.")
+        serializer.save(created_by=self.request.user)
+
+
+class StaffTaskDetailView(RetrieveUpdateDestroyAPIView):
+    """GET one manual task; PATCH edits it (completed: true/false marks done or reopens);
+    DELETE removes it (soft delete).
+
+    Visible to its assignee, its creator and admins; only the creator or an admin may delete.
+    """
+
+    permission_classes = [IsStaffMember]
+    serializer_class = StaffTaskSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = StaffTask.objects.filter(is_deleted=False).select_related(
+            "loan__opportunity", "assigned_to", "created_by", "completed_by",
+        )
+        if user.is_app_admin:
+            return qs
+        return qs.filter(Q(assigned_to=user) | Q(created_by=user))
+
+    def check_object_permissions(self, request, task):
+        super().check_object_permissions(request, task)
+        if request.method == "DELETE" and not (
+            request.user.is_app_admin or task.created_by_id == request.user.pk
+        ):
+            raise PermissionDenied("Only the task's creator or an admin can delete it.")
+
+    def perform_destroy(self, instance):
+        instance.is_deleted = True
+        instance.save(update_fields=["is_deleted", "updated_at"])

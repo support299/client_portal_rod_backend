@@ -1,4 +1,5 @@
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import serializers
 
 from accounts.models import User
@@ -9,6 +10,7 @@ from ghl.services import CustomFieldService
 from .draw_services import DrawService
 from .models import (
     DocumentRequest, DocumentType, DrawRequest, DrawRequestStatusChange, Loan, LoanDocument, LoanNote,
+    StaffTask,
 )
 from .services import DocumentService
 
@@ -549,3 +551,48 @@ class LoanNoteSerializer(serializers.ModelSerializer):
     def get_can_edit(self, obj):
         user = self.context["request"].user
         return user.is_app_admin or obj.author_id == user.pk
+
+
+class StaffTaskSerializer(serializers.ModelSerializer):
+    """A manual staff to-do. Write assigned_to_id to (re)assign; completed true/false marks it
+    done or reopens it (completed_at/completed_by follow automatically)."""
+
+    loan = serializers.PrimaryKeyRelatedField(
+        queryset=Loan.objects.filter(is_deleted=False), required=False, allow_null=True,
+    )
+    loan_name = serializers.SerializerMethodField()
+    assigned_to = DocumentUserSerializer(read_only=True)
+    assigned_to_id = serializers.PrimaryKeyRelatedField(
+        source="assigned_to", write_only=True,
+        queryset=User.objects.filter(is_active=True).exclude(role__in=(User.Role.BORROWER, User.Role.BROKER)),
+    )
+    created_by = DocumentUserSerializer(read_only=True)
+    completed_by = DocumentUserSerializer(read_only=True)
+    completed = serializers.BooleanField(write_only=True, required=False)
+
+    class Meta:
+        model = StaffTask
+        fields = [
+            "id", "title", "note", "loan", "loan_name", "assigned_to", "assigned_to_id",
+            "due_date", "completed", "completed_at", "completed_by", "created_by", "created_at",
+        ]
+        read_only_fields = ["completed_at", "completed_by", "created_by", "created_at"]
+
+    def get_loan_name(self, obj):
+        return str(obj.loan) if obj.loan_id else None
+
+    def validate_title(self, value):
+        if not value.strip():
+            raise serializers.ValidationError("A task needs a title.")
+        return value
+
+    def create(self, validated_data):
+        validated_data.pop("completed", None)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        completed = validated_data.pop("completed", None)
+        if completed is not None and completed != bool(instance.completed_at):
+            validated_data["completed_at"] = timezone.now() if completed else None
+            validated_data["completed_by"] = self.context["request"].user if completed else None
+        return super().update(instance, validated_data)

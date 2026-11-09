@@ -9,6 +9,8 @@ urlpatterns = [
     path("from-opportunity/", views.LoanFromOpportunityView.as_view(), name="loan_from_opportunity"),
     path("stages/", views.LoanStagesView.as_view(), name="loan_stages"),
     path("tasks/", task_views.TaskListView.as_view(), name="task_list"),
+    path("tasks/manual/", task_views.StaffTaskCreateView.as_view(), name="staff_task_create"),
+    path("tasks/manual/<int:pk>/", task_views.StaffTaskDetailView.as_view(), name="staff_task_detail"),
     path("<int:pk>/", views.LoanDetailView.as_view(), name="loan_detail"),
     path("<int:pk>/page/", page_views.LoanPageView.as_view(), name="loan_page"),
     # Documents

@@ -147,6 +147,39 @@ class LoanNote(models.Model):
         return f"Note {self.pk} ({self.loan})"
 
 
+class StaffTask(models.Model):
+    """A to-do a staff member creates for themselves or a teammate; optionally tied to a loan.
+
+    Open while completed_at is null. The Tasks page lists these alongside the derived review tasks.
+    """
+
+    loan = models.ForeignKey(Loan, on_delete=models.CASCADE, null=True, blank=True, related_name="staff_tasks")
+    title = models.CharField(max_length=255)
+    note = models.TextField(blank=True)
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="staff_tasks",
+    )
+    due_date = models.DateField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="+",
+    )
+    completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="+",
+    )
+    completed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    is_deleted = models.BooleanField(default=False, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return self.title
+
+
 class DocumentType(models.Model):
     """A kind of document the office collects, e.g. "Bank Statements"; admins manage the list."""
 
