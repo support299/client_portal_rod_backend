@@ -1,6 +1,7 @@
 import csv
 
 from django.db.models import Count, Sum
+from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -17,13 +18,16 @@ from loan.views import visible_loans
 def report_loans(request):
     """The loans a report covers: what the user can see, narrowed by the query params.
 
-    Query params (all optional): start, end (loan created date, YYYY-MM-DD), officer (user id),
+    Query params (all optional): start, end (the deal's GHL creation date, YYYY-MM-DD; falls
+    back to the loan's dashboard date when GHL has none), officer (user id),
     source, status (open/won/lost/abandoned), stage (pipeline stage id).
     Returns a fresh queryset on the matching ids, so later joins can't duplicate rows or sums.
     """
     params = request.query_params
-    loans = visible_loans(request.user)
-    for param, lookup in (("start", "created_at__date__gte"), ("end", "created_at__date__lte")):
+    loans = visible_loans(request.user).annotate(
+        deal_date=Coalesce("opportunity__date_added", "created_at"),
+    )
+    for param, lookup in (("start", "deal_date__date__gte"), ("end", "deal_date__date__lte")):
         value = params.get(param)
         if value:
             date = parse_date(value)
@@ -140,7 +144,7 @@ class LoanReportExportView(APIView):
         writer = csv.writer(response)
         writer.writerow([
             "ID", "Name", "Borrower", "Loan Officers", "Stage", "Opportunity Status",
-            "Lead Source", "Amount", "Expected Close", "Holdback", "Created",
+            "Lead Source", "Amount", "Expected Close", "Holdback", "Deal Created", "Added to Dashboard",
         ])
         for loan in loans:
             opportunity = loan.opportunity
@@ -155,6 +159,7 @@ class LoanReportExportView(APIView):
                 opportunity.monetary_value,
                 opportunity.expected_close_date or "",
                 loan.holdback_amount if loan.holdback_amount is not None else "",
+                opportunity.date_added.date().isoformat() if opportunity.date_added else "",
                 loan.created_at.date().isoformat(),
             ])
         return response
