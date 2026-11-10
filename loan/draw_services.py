@@ -48,6 +48,14 @@ class DrawService:
         return transitions.get(draw.status, [])
 
     @staticmethod
+    def check_post_closing(loan):
+        """Raise DrawError unless the loan's pipeline stage is Post Closing (case/spacing ignored)."""
+        stage = loan.opportunity.stage
+        name = " ".join((stage.name if stage else "").lower().split())
+        if "post closing" not in name:
+            raise DrawError("Draws can only be requested once the loan is in the Post Closing stage.")
+
+    @staticmethod
     def check_available(loan, amount, exclude=None):
         """Raise DrawError if `amount` is more than the loan has left; exclude a draw being changed.
 
@@ -86,7 +94,9 @@ class DrawService:
     @transaction.atomic
     def create(loan, user, amount_requested, borrower_comment=""):
         """Submit a draw (by the borrower, or staff for them); numbered after the loan's last draw."""
-        loan = Loan.objects.select_for_update().get(pk=loan.pk)
+        # of=("self",): lock only the loan row; Postgres can't lock the nullable stage join.
+        loan = Loan.objects.select_for_update(of=("self",)).select_related("opportunity__stage").get(pk=loan.pk)
+        DrawService.check_post_closing(loan)
         DrawService.check_available(loan, amount_requested)
         last = loan.draws.aggregate(last=Max("number"))["last"] or 0
         draw = DrawRequest.objects.create(

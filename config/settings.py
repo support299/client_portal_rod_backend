@@ -53,6 +53,7 @@ INSTALLED_APPS = [
     'loan',
     'chats',
     'notifications',
+    'report',
 ]
 
 AUTH_USER_MODEL = 'accounts.User'
