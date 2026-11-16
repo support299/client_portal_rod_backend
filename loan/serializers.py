@@ -223,6 +223,16 @@ class LoanUpdateSerializer(serializers.ModelSerializer):
                 )
             if "loan_officers" in attrs and main not in attrs["loan_officers"]:
                 attrs["loan_officers"].append(main)
+        # The holdback is part of the loan, so it can't exceed the loan amount. Check the
+        # values after this update: either may be changed here, or both.
+        if "holdback_amount" in attrs or "loan_amount" in attrs:
+            holdback = attrs.get("holdback_amount", self.instance.holdback_amount)
+            loan_amount = attrs.get("loan_amount", self.instance.opportunity.monetary_value)
+            if holdback is not None and loan_amount is not None and holdback > loan_amount:
+                field = "holdback_amount" if "holdback_amount" in attrs else "loan_amount"
+                raise serializers.ValidationError(
+                    {field: f"The holdback (${holdback:,.2f}) can't be more than the loan amount (${loan_amount:,.2f})."}
+                )
         return attrs
 
     def to_representation(self, instance):

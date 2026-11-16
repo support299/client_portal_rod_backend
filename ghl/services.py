@@ -203,12 +203,17 @@ class OpportunityService:
             # A stage GHL no longer returns can't satisfy the FK; the raw id is still kept.
             if opportunity.stage_id not in known_stages:
                 opportunity.stage_id = None
+        from loan.services import LoanService  # loan.services imports this module
+
+        before = LoanService.stage_snapshot([o.opportunity_id for o in opportunities])
         GHLOpportunity.objects.bulk_create(
             opportunities,
             update_conflicts=True,
             unique_fields=["opportunity_id"],
             update_fields=OpportunityService.UPDATE_FIELDS,
         )
+        # A stage moved in GHL is announced in the loan's chat.
+        LoanService.announce_stage_changes(before)
 
     @staticmethod
     def sync(location_id, batch_size=MAX_LIMIT, **params):

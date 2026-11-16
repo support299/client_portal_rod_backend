@@ -81,6 +81,15 @@ class OpportunityUpdateSerializer(serializers.Serializer):
     forecast_slippage_count = serializers.IntegerField(min_value=0)
     forecast_days_slipped = serializers.IntegerField(min_value=0)
 
+    def validate_monetary_value(self, value):
+        # The loan's holdback is part of the loan amount, so the amount can't drop below it.
+        loan = getattr(self.context["opportunity"], "loan", None)
+        if loan is not None and loan.holdback_amount is not None and value < loan.holdback_amount:
+            raise serializers.ValidationError(
+                f"This loan's holdback is ${loan.holdback_amount:,.2f}, so the amount can't be less."
+            )
+        return value
+
     def validate_pipeline_stage_id(self, value):
         opportunity = self.context["opportunity"]
         stage = GHLPipelineStage.objects.filter(stage_id=value).first()

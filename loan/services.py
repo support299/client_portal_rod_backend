@@ -181,6 +181,41 @@ class LoanService:
                 created.append(loan)
         return created, skipped
 
+    @staticmethod
+    def stage_snapshot(opportunity_ids):
+        """{opportunity_id: stage name} for the opportunities that have a loan, as currently stored.
+
+        Take it before saving opportunities from GHL, then pass it to announce_stage_changes.
+        """
+        rows = (
+            GHLOpportunity.objects.filter(opportunity_id__in=opportunity_ids, loan__isnull=False)
+            .values_list("opportunity_id", "stage__name")
+        )
+        return {opportunity_id: (name or "").strip() for opportunity_id, name in rows}
+
+    @staticmethod
+    def announce_stage_changes(before, actor=None):
+        """Post a system message in each loan's chat whose stage differs from `before`.
+
+        before: {opportunity_id: old stage name} from stage_snapshot. actor is the staff user who
+        moved it in the app; None when the change came from GHL.
+        """
+        if not before:
+            return
+        loans = (
+            Loan.objects.filter(opportunity_id__in=before, is_deleted=False)
+            .select_related("opportunity__stage")
+        )
+        for loan in loans:
+            old = before[loan.opportunity_id]
+            new = (loan.opportunity.stage.name if loan.opportunity.stage else "").strip()
+            if new == old:
+                continue
+            # Borrowers read this chat, so never show a staff email: name, or just "Staff".
+            who = f"{actor.get_full_name() or 'Staff'} moved" if actor else "Moved"
+            text = f"{who} the loan to {new or 'no stage'}" + (f" (from {old})" if old else "")
+            ChatService.send_message(ChatService.ensure_loan_chat(loan), None, text, kind=Message.Kind.SYSTEM)
+
 
 class SurveyAPIError(Exception):
     pass

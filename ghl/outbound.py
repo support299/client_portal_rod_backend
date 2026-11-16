@@ -80,8 +80,15 @@ def update_opportunity_in_ghl(opportunity, triggered_by=None, **fields):
     if "custom_fields" in fields and updated.get("customFields") is not None:
         opportunity.custom_fields = updated["customFields"]
         update_fields.append("custom_fields")
+    before = None
     if "pipeline_stage_id" in fields:
+        from loan.services import LoanService  # loan.services imports ghl.services
+
+        before = LoanService.stage_snapshot([opportunity.opportunity_id])
         opportunity.stage = GHLPipelineStage.objects.filter(stage_id=fields["pipeline_stage_id"]).first()
         update_fields.append("stage")
     opportunity.save(update_fields=update_fields)
+    if before:
+        # The move is announced in the loan's chat, naming who did it.
+        LoanService.announce_stage_changes(before, actor=triggered_by)
     return opportunity
