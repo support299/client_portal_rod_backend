@@ -110,7 +110,9 @@ class LoanStagesView(APIView):
 class LoanListView(ListAPIView):
     """List loans: admins see all, borrowers their own, other staff those assigned to them.
 
-    Query params (all optional): status (a stage id from LoanStagesView), borrower, loan_officer, search (loan name / borrower email), page, page_size.
+    Query params (all optional): status (a stage id from LoanStagesView), opportunity_status
+    (open/won/lost/abandoned; comma-separated for several, e.g. open,won), borrower, loan_officer,
+    search (loan name / borrower email), page, page_size.
     """
 
     pagination_class = LoanPagination
@@ -124,6 +126,10 @@ class LoanListView(ListAPIView):
         qs = visible_loans(self.request.user)
         if params.get("status"):
             qs = qs.filter(opportunity__pipeline_stage_id=params["status"])
+        # The deal's GHL status; lets the list leave out lost/abandoned deals
+        opp_statuses = [s.strip() for s in params.get("opportunity_status", "").split(",") if s.strip()]
+        if opp_statuses:
+            qs = qs.filter(opportunity__status__in=opp_statuses)
         if params.get("borrower"):
             qs = qs.filter(borrower=params["borrower"])
         if params.get("loan_officer"):
